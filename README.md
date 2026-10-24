@@ -149,10 +149,5 @@ Now, all non-domestic TCP traffic from Wi-Fi and LAN clients will transparently 
 
 ---
 
-## 🔒 Security & Privacy Notice
-This repository contains no pre-configured private keys, server addresses, or authentication tokens. All sample configuration files contain placeholders only.
-
----
-
 ## 📄 License
 Released under the [MIT License](LICENSE).
