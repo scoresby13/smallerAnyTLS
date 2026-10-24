@@ -64,6 +64,9 @@
 #define DEAD_TIMEOUT 45
 #define DNS_TIMEOUT 6
 #define MAX_BACKOFF 30
+/* Padding: max records per packet, largest record size */
+#define PAD_MAX_REC 16
+#define PAD_MAX_SIZE 16384
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
@@ -88,6 +91,9 @@ static int (*p_SSL_get_error)(const SSL*, int);
 static int (*p_SSL_shutdown)(SSL*);
 static void (*p_SSL_free)(SSL*);
 static unsigned char* (*p_SHA256)(const unsigned char*, size_t, unsigned char*);
+static int (*p_RAND_bytes)(unsigned char*, int);
+static int (*p_EVP_Digest)(const void*, size_t, unsigned char*, unsigned int*, const void*, void*);
+static const void* (*p_EVP_md5)(void);
 
 #define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
 #define SSL_CTRL_MODE 33
@@ -147,11 +153,14 @@ static int init_openssl(void) {
     p_SSL_shutdown = dlsym(h_ssl, "SSL_shutdown");
     p_SSL_free = dlsym(h_ssl, "SSL_free");
     p_SHA256 = dlsym(h_crypto, "SHA256");
+    p_RAND_bytes = dlsym(h_crypto, "RAND_bytes");
+    p_EVP_Digest = dlsym(h_crypto, "EVP_Digest");
+    p_EVP_md5 = dlsym(h_crypto, "EVP_md5");
 
     if (!p_TLS_client_method || !p_SSL_CTX_new || !p_SSL_CTX_set_verify || !p_SSL_new ||
         !p_SSL_set_fd || !p_SSL_ctrl || !p_SSL_set_alpn_protos || !p_SSL_connect ||
         !p_SSL_read || !p_SSL_write || !p_SSL_get_error || !p_SSL_shutdown ||
-        !p_SSL_free || !p_SHA256) {
+        !p_SSL_free || !p_SHA256 || !p_RAND_bytes || !p_EVP_Digest || !p_EVP_md5) {
         fprintf(stderr, "[anytls-tiny] Error: Failed to resolve required OpenSSL symbols: %s\n", dlerror());
         return -1;
     }
@@ -204,6 +213,7 @@ static uint8_t g_tx_buf[TX_BUF_SIZE];
 static int     g_tx_off = 0, g_tx_len = 0;
 static int     g_tx_inflight = 0;    /* length of an SSL_write that must be retried */
 static int     g_tx_want_write = 0;
+static int     g_tx_hold = 0;        /* cmdSettings waits for the first SYN, as in the reference client */
 static uint8_t g_client_rx_buf[CLIENT_READ_SIZE];
 static long    g_wbuf_total = 0;
 
@@ -219,6 +229,17 @@ static int  g_dns_fd = -1;
 /* SOCKS5-style address of the DNS resolver reached through the tunnel */
 static uint8_t g_dns_target[7] = { 0x01, 8, 8, 8, 8, 0, 53 };
 
+/* AnyTLS padding scheme; the server can replace it with cmdUpdatePaddingScheme */
+static const char g_default_scheme[] =
+    "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n"
+    "3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
+static char g_pad_scheme[2048];
+static char g_pad_md5[33];
+static int  g_pad_stop = 0;
+static int  g_pad_pkt = 0;           /* next packet number of this session (0 is the auth) */
+static int  g_pad_rec[PAD_MAX_REC];  /* TLS record sizes left in the packet being written */
+static int  g_pad_i = 0, g_pad_n = 0;
+
 static void set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -233,11 +254,102 @@ static int tx_pending(void) {
     return g_tx_len - g_tx_off;
 }
 
+/* Value of "key=" in the scheme's key=value lines, or NULL */
+static const char *scheme_get(const char *s, const char *key) {
+    size_t kl = strlen(key);
+    while (s) {
+        if (!strncmp(s, key, kl) && s[kl] == '=') return s + kl + 1;
+        s = strchr(s, '\n');
+        if (s) s++;
+    }
+    return NULL;
+}
+
+static int pad_set_scheme(const char *s, int len) {
+    char tmp[sizeof(g_pad_scheme)];
+    uint8_t md[16];
+    unsigned int mdlen;
+    if (len <= 0 || len >= (int)sizeof(tmp)) return -1;
+    memcpy(tmp, s, len);
+    tmp[len] = '\0';
+    const char *stop = scheme_get(tmp, "stop");
+    if (!stop || *stop < '0' || *stop > '9' || !p_EVP_Digest(tmp, len, md, &mdlen, p_EVP_md5(), NULL))
+        return -1;
+    memcpy(g_pad_scheme, tmp, len + 1);
+    g_pad_stop = atoi(stop);
+    for (int i = 0; i < 16; i++) sprintf(g_pad_md5 + 2 * i, "%02x", md[i]);
+    return 0;
+}
+
+/* Record sizes the scheme gives packet pkt, sampled from "a-b" ranges; -1 is a check mark */
+static int pad_sizes(int pkt, int *out) {
+    char key[12];
+    snprintf(key, sizeof(key), "%d", pkt);
+    const char *s = scheme_get(g_pad_scheme, key);
+    int n = 0;
+    while (s && n < PAD_MAX_REC - 1) {
+        char *e;
+        long lo = strtol(s, &e, 10), hi;
+        if (*s == 'c') {
+            out[n++] = -1;
+        } else if (e != s && *e == '-') {
+            hi = strtol(e + 1, &e, 10);
+            if (lo > hi) { long t = lo; lo = hi; hi = t; }
+            if (lo > 0) {
+                uint32_t r = 0;
+                p_RAND_bytes((unsigned char *)&r, sizeof(r));
+                if (hi > lo) lo += r % (hi - lo);
+                out[n++] = lo > PAD_MAX_SIZE ? PAD_MAX_SIZE : lo;
+            }
+        }
+        s = strpbrk(s, ",\n");
+        if (!s || *s++ == '\n') break;
+    }
+    return n;
+}
+
+/*
+ * Plan the next packet: everything queued now goes out as TLS records of the
+ * sizes the scheme asks for, with cmdWaste frames appended to fill them.
+ * Mirrors writeConn() in anytls-go's session.go.
+ */
+static void pad_plan(void) {
+    int sz[PAD_MAX_REC];
+    int n = pad_sizes(g_pad_pkt++, sz);
+    int remain = g_tx_len - g_tx_off;
+    g_pad_i = g_pad_n = 0;
+    for (int k = 0; k < n; k++) {
+        int l = sz[k], rec = remain;
+        if (l < 0) {
+            if (!remain) break;
+            continue;
+        }
+        if (remain > l) {
+            rec = l;
+        } else {
+            int pad = remain ? l - remain - FRAME_HDR : l;
+            if (pad > 0) {
+                if (g_tx_len + FRAME_HDR + pad > TX_BUF_SIZE) break;
+                uint8_t *p = g_tx_buf + g_tx_len;
+                memset(p, 0, FRAME_HDR + pad); /* cmdWaste, stream 0, zero data */
+                p[5] = (pad >> 8) & 0xFF;
+                p[6] = pad & 0xFF;
+                g_tx_len += FRAME_HDR + pad;
+                rec += FRAME_HDR + pad;
+            }
+        }
+        remain -= rec < remain ? rec : remain;
+        g_pad_rec[g_pad_n++] = rec;
+    }
+    if (remain) g_pad_rec[g_pad_n++] = remain;
+}
+
 /* Write as much of the TX buffer as the socket accepts without blocking. */
 static void flush_tx(void) {
-    while (g_ssl && !g_upstream_broken && g_tx_off < g_tx_len) {
+    while (g_ssl && !g_upstream_broken && !g_tx_hold && g_tx_off < g_tx_len) {
+        if (!g_pad_n && !g_tx_inflight && g_pad_pkt < g_pad_stop) pad_plan();
         /* A retried SSL_write must repeat the exact same buffer and length */
-        int len = g_tx_inflight ? g_tx_inflight : g_tx_len - g_tx_off;
+        int len = g_tx_inflight ? g_tx_inflight : g_pad_n ? g_pad_rec[g_pad_i] : g_tx_len - g_tx_off;
         int n = p_SSL_write(g_ssl, g_tx_buf + g_tx_off, len);
         if (n <= 0) {
             int err = p_SSL_get_error(g_ssl, n);
@@ -252,6 +364,7 @@ static void flush_tx(void) {
         }
         g_tx_inflight = 0;
         g_tx_off += n;
+        if (g_pad_n && (g_pad_rec[g_pad_i] -= n) == 0 && ++g_pad_i == g_pad_n) g_pad_n = 0;
     }
     g_tx_want_write = 0;
     if (g_tx_off == g_tx_len) g_tx_off = g_tx_len = 0;
@@ -329,12 +442,18 @@ static stream_t *alloc_stream(int client_fd, int is_redir) {
     return NULL;
 }
 
-/* Send cmdSYN + target address; stream IDs are assigned in SYN order */
-static int open_remote_stream(stream_t *st, const uint8_t *addr, int addr_len) {
-    st->stream_id = g_stream_counter;
+/* Send cmdSYN + target address and return the stream ID (0 on failure); IDs are assigned in SYN order */
+static uint32_t open_remote_stream(const uint8_t *addr, int addr_len) {
+    uint32_t sid = g_stream_counter;
     g_stream_counter += 2; /* Client stream IDs are odd */
-    if (queue_frame(CMD_SYN, st->stream_id, NULL, 0) < 0) return -1;
-    return queue_frame(CMD_PSH, st->stream_id, addr, addr_len);
+    if (queue_frame(CMD_SYN, sid, NULL, 0) < 0 || queue_frame(CMD_PSH, sid, addr, addr_len) < 0)
+        return 0;
+    /* Packet 1 is cmdSettings + the first SYN + its address; data follows in packet 2 */
+    if (g_tx_hold) {
+        g_tx_hold = 0;
+        flush_tx();
+    }
+    return sid;
 }
 
 static void close_stream(stream_t *st) {
@@ -473,6 +592,8 @@ static void disconnect_upstream(void) {
     g_rx_want_write = 0;
     g_tx_off = g_tx_len = g_tx_inflight = 0;
     g_tx_want_write = 0;
+    g_tx_hold = 0;
+    g_pad_n = g_pad_i = 0;
     close_all_streams();
 }
 
@@ -549,25 +670,32 @@ static int connect_upstream(void) {
     printf("[anytls-tiny] TLS handshake successful!\n");
     fflush(stdout);
 
-    /* 1. Auth Header: SHA256(password) + uint16(30) + 30 zero bytes, sent on its own */
-    uint8_t auth[32 + 2 + 30];
-    p_SHA256((const unsigned char *)g_password, strlen(g_password), auth);
-    auth[32] = 0;
-    auth[33] = 30;
-    memset(auth + 34, 0, 30);
+    /* 1. Packet 0: SHA256(password) + uint16 padding0 length + padding0 zero bytes, sent on its own */
+    int sz[PAD_MAX_REC];
+    int pad0 = pad_sizes(0, sz) > 0 && sz[0] > 0 ? sz[0] : 0;
+    int alen = 34 + pad0;
+    p_SHA256((const unsigned char *)g_password, strlen(g_password), g_tx_buf);
+    g_tx_buf[32] = (pad0 >> 8) & 0xFF;
+    g_tx_buf[33] = pad0 & 0xFF;
+    memset(g_tx_buf + 34, 0, pad0);
 
-    if (p_SSL_write(g_ssl, auth, sizeof(auth)) <= 0) {
-        disconnect_upstream();
-        return -1;
+    for (int off = 0, n; off < alen; off += n) {
+        if ((n = p_SSL_write(g_ssl, g_tx_buf + off, alen - off)) <= 0) {
+            disconnect_upstream();
+            return -1;
+        }
     }
 
     set_nonblock(g_ssl_fd);
     g_rx_len = 0;
     g_connected_at = g_last_rx = g_last_hb = now;
 
-    /* 2. cmdSettings is queued so it shares a TLS record with the first SYN */
-    static const char settings_data[] = "v=2\nclient=anytls/0.0.1\npadding-md5=00000000000000000000000000000000\n";
-    queue_frame(CMD_SETTINGS, 0, (const uint8_t *)settings_data, sizeof(settings_data) - 1);
+    /* 2. cmdSettings is held back so it goes out in packet 1 together with the first SYN */
+    char settings[80];
+    int slen = snprintf(settings, sizeof(settings), "v=2\nclient=anytls/0.0.1\npadding-md5=%s\n", g_pad_md5);
+    g_pad_pkt = 1;
+    queue_frame(CMD_SETTINGS, 0, (const uint8_t *)settings, slen);
+    g_tx_hold = 1;
 
     printf("[anytls-tiny] AnyTLS Auth + Settings sent successfully! Ready for traffic.\n");
     fflush(stdout);
@@ -636,7 +764,7 @@ static void handle_new_connection(int listen_fd, int is_redir) {
             memcpy(socks_addr + 1, &orig_dst.sin_addr.s_addr, 4);
             memcpy(socks_addr + 5, &orig_dst.sin_port, 2);
 
-            if (open_remote_stream(st, socks_addr, 7) < 0) close_stream(st);
+            if (!(st->stream_id = open_remote_stream(socks_addr, 7))) close_stream(st);
         }
     }
 }
@@ -681,7 +809,7 @@ static void handle_socks_handshake(stream_t *st) {
     }
     if (n < 3 + saddr_len) { close_stream(st); return; }
 
-    if (open_remote_stream(st, saddr, saddr_len) < 0 || stream_write(st, resp, 10) < 0) {
+    if (!(st->stream_id = open_remote_stream(saddr, saddr_len)) || stream_write(st, resp, 10) < 0) {
         close_stream(st);
         return;
     }
@@ -738,18 +866,15 @@ static void handle_dns_udp_query(void) {
     }
     if (!d) return;
 
-    d->stream_id = g_stream_counter;
-    g_stream_counter += 2;
+    /* One stream per query to the configured resolver, query sent with 2-byte length prefix */
+    if (!(d->stream_id = open_remote_stream(g_dns_target, sizeof(g_dns_target)))) return;
     d->client_addr = cli;
     d->expire = time(NULL) + DNS_TIMEOUT;
     g_dns_active++;
 
-    /* One stream per query to the configured resolver, query sent with 2-byte length prefix */
     buf[0] = (n >> 8) & 0xFF;
     buf[1] = n & 0xFF;
-    if (queue_frame(CMD_SYN, d->stream_id, NULL, 0) < 0 ||
-        queue_frame(CMD_PSH, d->stream_id, g_dns_target, sizeof(g_dns_target)) < 0 ||
-        queue_frame(CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
+    if (queue_frame(CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
         release_dns_req(d, 0);
     }
 }
@@ -821,12 +946,19 @@ static void handle_frame(uint8_t cmd, uint32_t sid, const uint8_t *data, int len
             }
         }
         break;
+    case CMD_UPDATE_PADDING:
+        /* Used from the next packet on, and by every later session */
+        if (pad_set_scheme((const char *)data, len) == 0) {
+            printf("[anytls-tiny] Padding scheme updated by server (md5 %s)\n", g_pad_md5);
+            fflush(stdout);
+        }
+        break;
     case CMD_ALERT:
         fprintf(stderr, "[anytls-tiny] Alert from server: %.*s\n", len > 200 ? 200 : len, (const char *)data);
         g_upstream_broken = 1;
         break;
     default:
-        /* cmdWaste, cmdUpdatePaddingScheme, cmdHeartResponse: nothing to do */
+        /* cmdWaste, cmdHeartResponse: nothing to do */
         break;
     }
 }
@@ -999,6 +1131,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    pad_set_scheme(g_default_scheme, sizeof(g_default_scheme) - 1);
     g_ssl_ctx = p_SSL_CTX_new(p_TLS_client_method());
     if (!g_ssl_ctx) {
         fprintf(stderr, "[anytls-tiny] Error: SSL_CTX_new failed\n");

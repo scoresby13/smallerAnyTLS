@@ -20,7 +20,7 @@ Many legacy or compact consumer routers (e.g. Netgear, TP-Link, Xiaomi, GL.iNet)
 
 ## 🚀 Features
 
-- **AnyTLS v2 Protocol**: Stream multiplexing, SHA-256 password authentication, settings negotiation, `cmdSYNACK` error handling, server alerts, and heartbeats with dead-session detection (see [Limitations](#-limitations)).
+- **AnyTLS v2 Protocol**: Stream multiplexing, SHA-256 password authentication, settings negotiation, the padding scheme (the first packets of each session are split into TLS records of randomized sizes and filled with `cmdWaste`, and the server can replace the scheme with `cmdUpdatePaddingScheme`), `cmdSYNACK` error handling, server alerts, and heartbeats with dead-session detection (see [Limitations](#-limitations)).
 - **SOCKS5 Server**: Standard SOCKS5 listener (default port `1080`).
 - **Transparent TCP Redirection (`SO_ORIGINAL_DST`)**: Seamlessly redirects outbound LAN/Wi-Fi TCP connections to port `1100` without requiring any client-side app on user devices.
 - **Clean DNS Forwarder**: Listens on UDP port `5353` and tunnels DNS queries over TCP to a clean resolver (default `8.8.8.8:53`, configurable with `-n`) via AnyTLS, defeating DNS poisoning.
@@ -38,6 +38,8 @@ git clone https://github.com/scoresby13/smallerAnyTLS.git
 cd smallerAnyTLS
 make
 ```
+
+Tests: `python3 tests/padding_test.py ./anytls-tiny` runs the client against a mock AnyTLS server that checks the size of every TLS record against the padding scheme and relays SOCKS5 and DNS traffic (needs Python 3.11+ and the `openssl` CLI).
 
 ### 2. Cross-Compiling for OpenWrt (MIPS, ARM, AArch64)
 
@@ -178,7 +180,8 @@ Now, all non-domestic IPv4 TCP traffic from Wi-Fi and LAN clients will transpare
 ## ⚠️ Limitations
 
 - **One TLS session for all connections.** The reference AnyTLS client (used by Mihomo / sing-box) keeps a pool of sessions and gives each concurrent connection its own. Here every connection shares one TCP connection, so packet loss on that link slows everything at once. A client that stops reading for long (over 256 KB behind for 10 s) is dropped so it can't stall the rest.
-- **No padding scheme.** AnyTLS's traffic-shaping padding (`cmdWaste`, packet splitting) is not implemented, and the TLS ClientHello is OpenSSL's rather than a browser fingerprint. Traffic is therefore easier to classify than with Mihomo.
+- **OpenSSL TLS fingerprint.** The padding scheme is implemented as in the reference client (the default scheme, or the one the server pushes, which is kept for later sessions until the process restarts). But the outer TLS ClientHello is OpenSSL's rather than a browser's (no uTLS), so the connection itself is easier to single out than with Mihomo / sing-box.
+- **Padding counts batches, not writes.** The reference client pads each write call; here frames queued in one event-loop pass go out as one padded packet. The first packets follow the same layout (auth, then settings + first SYN, then the first data), but under concurrent traffic later packets can hold more than one write.
 - **No certificate verification.** The server certificate is not checked (like `skip-cert-verify: true`). Someone who can intercept the connection could capture the password hash.
 - **IPv4 and TCP only** (plus DNS). No IPv6 listener, no general UDP relay.
 
