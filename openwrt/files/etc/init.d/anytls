@@ -11,6 +11,7 @@ start_service() {
     config_load "$CONF"
 
     local enabled server port password sni socks_port redir_port dns_port dns_server listen_addr
+    local max_sessions idle_timeout min_idle
     config_get_bool enabled main enabled 0
     [ "$enabled" -eq 1 ] || return 0
 
@@ -23,6 +24,9 @@ start_service() {
     config_get dns_port main dns_port "5353"
     config_get dns_server main dns_server "8.8.8.8:53"
     config_get listen_addr main listen_addr "0.0.0.0"
+    config_get max_sessions main max_sessions "8"
+    config_get idle_timeout main idle_timeout "60"
+    config_get min_idle main min_idle "1"
 
     [ -n "$server" ] && [ -n "$password" ] || {
         echo "[anytls] Error: server and password must be configured in /etc/config/anytls" >&2
@@ -41,7 +45,10 @@ start_service() {
         -r "$redir_port" \
         -u "$dns_port" \
         -n "$dns_server" \
-        -b "$listen_addr"
+        -b "$listen_addr" \
+        -m "$max_sessions" \
+        -i "$idle_timeout" \
+        -w "$min_idle"
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
     procd_set_param stderr 1

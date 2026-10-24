@@ -20,11 +20,12 @@ Many legacy or compact consumer routers (e.g. Netgear, TP-Link, Xiaomi, GL.iNet)
 
 ## 🚀 Features
 
-- **AnyTLS v2 Protocol**: Stream multiplexing, SHA-256 password authentication, settings negotiation, `cmdSYNACK` error handling, server alerts, and heartbeats with dead-session detection (see [Limitations](#-limitations)).
+- **AnyTLS v2 Protocol**: Stream multiplexing over a session pool, SHA-256 password authentication, settings negotiation, `cmdSYNACK` error handling, server alerts, and heartbeats with dead-session detection (see [Limitations](#-limitations)).
 - **SOCKS5 Server**: Standard SOCKS5 listener (default port `1080`).
 - **Transparent TCP Redirection (`SO_ORIGINAL_DST`)**: Seamlessly redirects outbound LAN/Wi-Fi TCP connections to port `1100` without requiring any client-side app on user devices.
 - **Clean DNS Forwarder**: Listens on UDP port `5353` and tunnels DNS queries over TCP to a clean resolver (default `8.8.8.8:53`, configurable with `-n`) via AnyTLS, defeating DNS poisoning.
 - **Built for slow links and busy LANs**: non-blocking I/O in both directions, frames batched into full TLS records, per-client buffering with backpressure (a slow Wi-Fi client no longer gets its downloads cut off mid-transfer), and automatic reconnect with backoff.
+- **Session pool**: like the reference client, each concurrent connection gets its own TLS session (an idle one is reused, newest first), so packet loss or a slow LAN client on one connection doesn't hold up the others. Sessions are capped (`-m`, default 8) and closed after sitting idle (`-i`, default 60 s); past the cap, connections share the least-busy session. DNS queries share a single session.
 - **Full OpenWrt Integration**: Ready-to-use `procd` init script (`/etc/init.d/anytls`), UCI configuration (`/etc/config/anytls`), and `nftables` / `fw4` rule integration with `chnroute` bypass.
 
 ---
@@ -84,6 +85,9 @@ Optional:
   -u <port>       DNS-over-TCP UDP listening port (default: 5353, 0 = off)
   -n <ip[:port]>  DNS resolver reached through the tunnel (default: 8.8.8.8:53)
   -b <ip>         Listen address for SOCKS5 and DNS (default: 0.0.0.0)
+  -m <n>          Max TLS sessions to the server (1-32, default: 8)
+  -i <seconds>    Close sessions idle for this long (default: 60)
+  -w <n>          Idle sessions kept open past the timeout (default: 1)
   -d              Run as background daemon
 ```
 
@@ -131,6 +135,9 @@ config anytls 'main'
 	option dns_port '5353'
 	option dns_server '8.8.8.8:53'
 	option listen_addr '0.0.0.0'
+	option max_sessions '8'
+	option idle_timeout '60'
+	option min_idle '1'
 ```
 
 > The SOCKS5 port has no authentication. OpenWrt's default firewall blocks it from the WAN side. On other machines, set `listen_addr` / `-b` to `127.0.0.1` unless LAN devices need it.
@@ -177,7 +184,8 @@ Now, all non-domestic IPv4 TCP traffic from Wi-Fi and LAN clients will transpare
 
 ## ⚠️ Limitations
 
-- **One TLS session for all connections.** The reference AnyTLS client (used by Mihomo / sing-box) keeps a pool of sessions and gives each concurrent connection its own. Here every connection shares one TCP connection, so packet loss on that link slows everything at once. A client that stops reading for long (over 256 KB behind for 10 s) is dropped so it can't stall the rest.
+- **Bounded session pool.** Like the reference client (used by Mihomo / sing-box), each concurrent connection gets its own TLS session, but only up to `-m` sessions (default 8) to keep router RAM in check. Past that, connections share sessions and the old trade-offs come back for the ones that share: packet loss on that TCP connection slows all of them, and a LAN client that falls more than 256 KB behind pauses its session until it catches up. Any client that stays that far behind for 10 s is dropped. Each busy session costs OpenSSL's per-connection state, 128 KB of frame buffers (released once it goes idle) and up to 256 KB of backlog per slow client (about 2 MB in total). In testing, 8 busy sessions peaked about 5 MB above the single-session version, so lower `-m` on routers with very little free RAM.
+- **Blocking DNS lookup of the server.** The server's hostname is resolved with `getaddrinfo`, which blocks the event loop while it runs. The result is cached for 10 minutes (and refreshed after a failed connect), so this is rare. Using the server's IP address avoids it.
 - **No padding scheme.** AnyTLS's traffic-shaping padding (`cmdWaste`, packet splitting) is not implemented, and the TLS ClientHello is OpenSSL's rather than a browser fingerprint. Traffic is therefore easier to classify than with Mihomo.
 - **No certificate verification.** The server certificate is not checked (like `skip-cert-verify: true`). Someone who can intercept the connection could capture the password hash.
 - **IPv4 and TCP only** (plus DNS). No IPv6 listener, no general UDP relay.

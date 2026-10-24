@@ -6,7 +6,7 @@
  * Dependencies: libc, libdl (dynamically loads OpenSSL from firmware ROM).
  *
  * Supports:
- *  - AnyTLS v2 multiplexed TLS tunnel
+ *  - AnyTLS v2 multiplexed TLS tunnel with a session pool
  *  - SOCKS5 proxy server
  *  - Transparent TCP redirection (SO_ORIGINAL_DST)
  *  - Anti-poisoning UDP-to-TCP DNS forwarder
@@ -48,22 +48,30 @@
 #define FRAME_HDR 7
 #define MAX_STREAMS 256
 #define MAX_DNS_REQS 64
-#define RX_BUF_SIZE (128 * 1024)
-#define TX_BUF_SIZE (128 * 1024)
-/* Stop reading LAN clients while this much tunnel output is still unsent */
-#define TX_HIGH_WATER (64 * 1024)
+/* Hard upper bound for -m; each live session costs one TLS connection */
+#define MAX_SESSIONS 32
+/* Per-session buffers, allocated on demand and released while the session is idle.
+ * RX holds one maximum-size frame (7 + 65535 bytes) with a little slack. */
+#define RX_BUF_SIZE (64 * 1024 + 16)
+#define TX_BUF_SIZE (64 * 1024)
+/* Stop reading a session's LAN clients while this much tunnel output is still unsent */
+#define TX_HIGH_WATER (32 * 1024)
 /* One PSH frame (header + data) fills exactly one 16 KB TLS record */
 #define CLIENT_READ_SIZE (16384 - FRAME_HDR)
-/* Per-stream / total downstream backlog before the tunnel stops reading */
+/* Per-stream / total downstream backlog before a session stops reading */
 #define WBUF_STREAM_MAX (256 * 1024)
 #define WBUF_TOTAL_MAX (2 * 1024 * 1024)
-/* A stream that blocks the tunnel this long without draining is dropped */
+/* A stream that blocks its session this long without draining is dropped */
 #define STALL_TIMEOUT 10
 #define IDLE_WRITE_TIMEOUT 60
 #define HEARTBEAT_IDLE 15
 #define DEAD_TIMEOUT 45
 #define DNS_TIMEOUT 6
 #define MAX_BACKOFF 30
+/* TCP connect + TLS handshake must finish within this many seconds */
+#define CONNECT_TIMEOUT 10
+#define IDLE_CHECK_INTERVAL 30
+#define RESOLVE_TTL 600
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
@@ -88,11 +96,13 @@ static int (*p_SSL_get_error)(const SSL*, int);
 static int (*p_SSL_shutdown)(SSL*);
 static void (*p_SSL_free)(SSL*);
 static unsigned char* (*p_SHA256)(const unsigned char*, size_t, unsigned char*);
+static void (*p_ERR_clear_error)(void);
 
 #define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
 #define SSL_CTRL_MODE 33
 #define SSL_MODE_ENABLE_PARTIAL_WRITE 0x1
 #define SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER 0x2
+#define SSL_MODE_RELEASE_BUFFERS 0x10
 #define TLSEXT_NAMETYPE_host_name 0
 #define SSL_VERIFY_NONE 0
 #define SSL_ERROR_WANT_READ 2
@@ -147,6 +157,7 @@ static int init_openssl(void) {
     p_SSL_shutdown = dlsym(h_ssl, "SSL_shutdown");
     p_SSL_free = dlsym(h_ssl, "SSL_free");
     p_SHA256 = dlsym(h_crypto, "SHA256");
+    p_ERR_clear_error = dlsym(h_crypto, "ERR_clear_error");
 
     if (!p_TLS_client_method || !p_SSL_CTX_new || !p_SSL_CTX_set_verify || !p_SSL_new ||
         !p_SSL_set_fd || !p_SSL_ctrl || !p_SSL_set_alpn_protos || !p_SSL_connect ||
@@ -158,10 +169,45 @@ static int init_openssl(void) {
     return 0;
 }
 
+/* SSL_get_error() misreports WANT_READ/WANT_WRITE if errors from another session are queued */
+static void clear_ssl_errors(void) {
+    if (p_ERR_clear_error) p_ERR_clear_error();
+}
+
+/*
+ * Session pool: like the reference client, each connection gets an idle
+ * session of its own (newest first) or a new one, and returns it to the pool
+ * when it closes. Idle sessions are closed after g_idle_timeout seconds.
+ * Past g_max_sessions, connections share the least-loaded session.
+ */
+enum { SESS_FREE = 0, SESS_CONNECTING, SESS_HANDSHAKE, SESS_READY };
+
+typedef struct {
+    SSL *ssl;
+    int fd;
+    uint8_t state;
+    uint8_t broken;         /* torn down at the end of the current loop pass */
+    uint8_t rx_kick;        /* frames may be waiting without a POLLIN */
+    uint8_t rx_want_write;  /* SSL_read / SSL_connect asked for POLLOUT */
+    uint8_t tx_want_write;
+    int peer_version;
+    uint32_t seq;           /* creation order; the newest idle session is reused first */
+    uint32_t next_sid;
+    int nstreams, ndns;     /* TCP streams / DNS queries currently using the session */
+    long wbuf_total;        /* downstream backlog of this session's streams */
+    uint8_t *rx_buf;
+    int rx_len;
+    uint8_t *tx_buf;
+    int tx_off, tx_len;
+    int tx_inflight;        /* length of an SSL_write that must be retried */
+    time_t created, ready_at, idle_since, last_rx, last_hb;
+} session_t;
+
 /* Stream tracking */
 typedef struct {
     uint32_t stream_id;   /* 0 until cmdSYN has been sent */
     int client_fd;
+    session_t *sess;      /* NULL until the stream is opened upstream */
     uint8_t is_redir;
     uint8_t socks_state;  /* 0: auth, 1: req, 2: connected */
     uint8_t remote_fin;   /* server closed the stream; close once wbuf drains */
@@ -173,37 +219,27 @@ typedef struct {
 
 typedef struct {
     uint32_t stream_id;   /* 0 = slot free */
+    session_t *sess;
     struct sockaddr_in client_addr;
     time_t expire;
     uint8_t *rbuf;        /* reassembly of a reply split across PSH frames */
     int rlen;
 } dns_req_t;
 
+static session_t g_sessions[MAX_SESSIONS];
+static uint32_t  g_session_seq = 0;
+static session_t *g_dns_sess = NULL;  /* DNS queries share one session */
 static stream_t  g_streams[MAX_STREAMS];
 static dns_req_t g_dns_reqs[MAX_DNS_REQS];
 static int       g_dns_active = 0;
-static uint32_t  g_stream_counter = 1;
 
 static SSL_CTX *g_ssl_ctx = NULL;
-static SSL     *g_ssl = NULL;
-static int      g_ssl_fd = -1;
-static int      g_upstream_broken = 0;
-static int      g_peer_version = 0;
 static int      g_backoff = 0;
 static time_t   g_next_connect = 0;
-static time_t   g_connected_at = 0;
-static time_t   g_last_rx = 0;
-static time_t   g_last_hb = 0;
+static time_t   g_last_fail = 0;
+static struct sockaddr_in g_srv_addr;
+static time_t   g_srv_resolved = 0;
 
-/* Static BSS buffers */
-static uint8_t g_rx_buf[RX_BUF_SIZE];
-static int     g_rx_len = 0;
-static int     g_rx_kick = 0;        /* frames may be waiting without a POLLIN */
-static int     g_rx_want_write = 0;  /* SSL_read asked for POLLOUT */
-static uint8_t g_tx_buf[TX_BUF_SIZE];
-static int     g_tx_off = 0, g_tx_len = 0;
-static int     g_tx_inflight = 0;    /* length of an SSL_write that must be retried */
-static int     g_tx_want_write = 0;
 static uint8_t g_client_rx_buf[CLIENT_READ_SIZE];
 static long    g_wbuf_total = 0;
 
@@ -216,6 +252,9 @@ static int  g_socks_port = 1080;
 static int  g_redir_port = 1100;
 static int  g_dns_port = 5353;
 static int  g_dns_fd = -1;
+static int  g_max_sessions = 8;
+static int  g_idle_timeout = 60;
+static int  g_min_idle = 1;
 /* SOCKS5-style address of the DNS resolver reached through the tunnel */
 static uint8_t g_dns_target[7] = { 0x01, 8, 8, 8, 8, 0, 53 };
 
@@ -229,70 +268,80 @@ static void set_tcp_nodelay(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
-static int tx_pending(void) {
-    return g_tx_len - g_tx_off;
+static int session_live(const session_t *s) {
+    return s->state != SESS_FREE && !s->broken;
 }
 
-/* Write as much of the TX buffer as the socket accepts without blocking. */
-static void flush_tx(void) {
-    while (g_ssl && !g_upstream_broken && g_tx_off < g_tx_len) {
+static int tx_pending(const session_t *s) {
+    return s->tx_len - s->tx_off;
+}
+
+/* Write as much of the session's TX buffer as the socket accepts without blocking. */
+static void flush_tx(session_t *s) {
+    while (s->state == SESS_READY && !s->broken && s->tx_off < s->tx_len) {
         /* A retried SSL_write must repeat the exact same buffer and length */
-        int len = g_tx_inflight ? g_tx_inflight : g_tx_len - g_tx_off;
-        int n = p_SSL_write(g_ssl, g_tx_buf + g_tx_off, len);
+        int len = s->tx_inflight ? s->tx_inflight : s->tx_len - s->tx_off;
+        clear_ssl_errors();
+        int n = p_SSL_write(s->ssl, s->tx_buf + s->tx_off, len);
         if (n <= 0) {
-            int err = p_SSL_get_error(g_ssl, n);
+            int err = p_SSL_get_error(s->ssl, n);
             if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                g_tx_inflight = len;
-                g_tx_want_write = (err == SSL_ERROR_WANT_WRITE);
+                s->tx_inflight = len;
+                s->tx_want_write = (err == SSL_ERROR_WANT_WRITE);
                 return;
             }
-            fprintf(stderr, "[anytls-tiny] Upstream write failed (err=%d)\n", err);
-            g_upstream_broken = 1;
+            fprintf(stderr, "[anytls-tiny] Session %u: upstream write failed (err=%d)\n", s->seq, err);
+            s->broken = 1;
             return;
         }
-        g_tx_inflight = 0;
-        g_tx_off += n;
+        s->tx_inflight = 0;
+        s->tx_off += n;
     }
-    g_tx_want_write = 0;
-    if (g_tx_off == g_tx_len) g_tx_off = g_tx_len = 0;
+    if (s->tx_off == s->tx_len) {
+        s->tx_off = s->tx_len = 0;
+        s->tx_want_write = 0;
+    }
 }
 
-static int tx_reserve(int need) {
-    if (g_tx_len + need <= TX_BUF_SIZE) return 0;
-    flush_tx();
-    if (g_tx_off > 0 && !g_tx_inflight) {
-        memmove(g_tx_buf, g_tx_buf + g_tx_off, g_tx_len - g_tx_off);
-        g_tx_len -= g_tx_off;
-        g_tx_off = 0;
+static void tx_compact(session_t *s) {
+    if (s->tx_off > 0 && !s->tx_inflight) {
+        memmove(s->tx_buf, s->tx_buf + s->tx_off, s->tx_len - s->tx_off);
+        s->tx_len -= s->tx_off;
+        s->tx_off = 0;
     }
+}
+
+static int tx_reserve(session_t *s, int need) {
+    if (!s->tx_buf && !(s->tx_buf = malloc(TX_BUF_SIZE))) return -1;
+    if (s->tx_len + need <= TX_BUF_SIZE) return 0;
+    flush_tx(s);
+    tx_compact(s);
     /* Still full: the uplink is congested, wait for it to drain */
-    for (int tries = 0; g_tx_len + need > TX_BUF_SIZE; tries++) {
-        if (!g_ssl || g_upstream_broken || tries >= 10) {
-            g_upstream_broken = 1;
+    for (int tries = 0; s->tx_len + need > TX_BUF_SIZE; tries++) {
+        if (s->state != SESS_READY) return -1;
+        if (s->broken || tries >= 10) {
+            s->broken = 1;
             return -1;
         }
-        struct pollfd pfd = { .fd = g_ssl_fd, .events = g_tx_want_write ? POLLOUT : POLLIN };
+        struct pollfd pfd = { .fd = s->fd, .events = s->tx_want_write ? POLLOUT : POLLIN };
         poll(&pfd, 1, 1000);
-        flush_tx();
-        if (g_tx_off > 0 && !g_tx_inflight) {
-            memmove(g_tx_buf, g_tx_buf + g_tx_off, g_tx_len - g_tx_off);
-            g_tx_len -= g_tx_off;
-            g_tx_off = 0;
-        }
+        flush_tx(s);
+        tx_compact(s);
     }
     return 0;
 }
 
 /*
- * Frames are batched in the TX buffer and flushed once per event-loop pass,
- * so small control frames share TLS records with data instead of each
- * costing their own record and TCP segment.
+ * Frames are batched in the session's TX buffer and flushed once per
+ * event-loop pass, so small control frames share TLS records with data
+ * instead of each costing their own record and TCP segment. Frames queued
+ * while the session is still connecting go out right after the handshake.
  */
-static int queue_frame(uint8_t cmd, uint32_t stream_id, const uint8_t *data, uint16_t len) {
-    if (!g_ssl || g_upstream_broken) return -1;
-    if (tx_reserve(FRAME_HDR + len) < 0) return -1;
+static int queue_frame(session_t *s, uint8_t cmd, uint32_t stream_id, const uint8_t *data, uint16_t len) {
+    if (!session_live(s)) return -1;
+    if (tx_reserve(s, FRAME_HDR + len) < 0) return -1;
 
-    uint8_t *p = g_tx_buf + g_tx_len;
+    uint8_t *p = s->tx_buf + s->tx_len;
     p[0] = cmd;
     p[1] = (stream_id >> 24) & 0xFF;
     p[2] = (stream_id >> 16) & 0xFF;
@@ -303,14 +352,254 @@ static int queue_frame(uint8_t cmd, uint32_t stream_id, const uint8_t *data, uin
     if (len > 0 && data) {
         memcpy(p + FRAME_HDR, data, len);
     }
-    g_tx_len += FRAME_HDR + len;
+    s->tx_len += FRAME_HDR + len;
     return 0;
 }
 
-static stream_t *find_stream_by_id(uint32_t sid) {
+static void session_unref(session_t *s, int dns) {
+    if (dns) s->ndns--;
+    else s->nstreams--;
+    if (s->nstreams + s->ndns == 0) s->idle_since = time(NULL);
+}
+
+static void bump_backoff(time_t now) {
+    /* Attempts that fail together (e.g. the server is down) count once */
+    if (now < g_next_connect) return;
+    g_last_fail = now;
+    g_backoff = g_backoff ? (g_backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : g_backoff * 2) : 1;
+    g_next_connect = now + g_backoff;
+}
+
+static int resolve_server(time_t now) {
+    if (g_srv_resolved && now - g_srv_resolved < RESOLVE_TTL) return 0;
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", g_server_port);
+
+    if (getaddrinfo(g_server_host, port_str, &hints, &res) != 0 || !res) {
+        fprintf(stderr, "[anytls-tiny] Failed to resolve %s\n", g_server_host);
+        return -1;
+    }
+    memcpy(&g_srv_addr, res->ai_addr, sizeof(g_srv_addr));
+    freeaddrinfo(res);
+    g_srv_resolved = now;
+    return 0;
+}
+
+static void session_handshake(session_t *s) {
+    clear_ssl_errors();
+    int r = p_SSL_connect(s->ssl);
+    if (r == 1) {
+        s->state = SESS_READY;
+        s->rx_want_write = 0;
+        s->ready_at = s->last_rx = s->last_hb = time(NULL);
+        printf("[anytls-tiny] Session %u: TLS handshake done, auth + settings sent\n", s->seq);
+        fflush(stdout);
+        flush_tx(s);
+        return;
+    }
+    int err = p_SSL_get_error(s->ssl, r);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        s->rx_want_write = (err == SSL_ERROR_WANT_WRITE);
+        return;
+    }
+    fprintf(stderr, "[anytls-tiny] Session %u: SSL_connect failed (err=%d)\n", s->seq, err);
+    s->broken = 1;
+}
+
+static void session_start_tls(session_t *s) {
+    s->ssl = p_SSL_new(g_ssl_ctx);
+    if (!s->ssl) {
+        s->broken = 1;
+        return;
+    }
+    p_SSL_set_fd(s->ssl, s->fd);
+    p_SSL_ctrl(s->ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, g_sni);
+    /* RELEASE_BUFFERS lets idle sessions give OpenSSL's record buffers back */
+    p_SSL_ctrl(s->ssl, SSL_CTRL_MODE, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+               SSL_MODE_RELEASE_BUFFERS, NULL);
+
+    /* ALPN: h2, http/1.1 */
+    static const unsigned char alpn[] = { 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    p_SSL_set_alpn_protos(s->ssl, alpn, sizeof(alpn));
+
+    s->state = SESS_HANDSHAKE;
+    session_handshake(s);
+}
+
+/* The non-blocking connect() finished (or failed) */
+static void session_connected(session_t *s) {
+    int err = 0;
+    socklen_t elen = sizeof(err);
+    if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err) {
+        fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(err ? err : errno));
+        s->broken = 1;
+        return;
+    }
+    session_start_tls(s);
+}
+
+static void session_free(session_t *s, const char *why) {
+    time_t now = time(NULL);
+    if (s->broken) {
+        /* A session that fails to come up, or dies right after (e.g. wrong password), backs off */
+        if (s->state != SESS_READY || now - s->ready_at < 10) bump_backoff(now);
+        if (s->state != SESS_READY) g_srv_resolved = 0; /* the server's address may have changed */
+    }
+    printf("[anytls-tiny] Session %u closed (%s, %d stream(s))\n", s->seq, why, s->nstreams);
+    fflush(stdout);
+
+    if (s->ssl) {
+        if (s->state == SESS_READY && !s->broken) p_SSL_shutdown(s->ssl);
+        p_SSL_free(s->ssl);
+    }
+    if (s->fd >= 0) close(s->fd);
+
+    /* Streams can't move to another session: the server only knows them here */
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        stream_t *st = &g_streams[i];
+        if (st->client_fd > 0 && st->sess == s) {
+            close(st->client_fd);
+            g_wbuf_total -= st->wlen - st->woff;
+            free(st->wbuf);
+            memset(st, 0, sizeof(*st));
+            st->client_fd = -1;
+        }
+    }
+    for (int i = 0; i < MAX_DNS_REQS; i++) {
+        dns_req_t *d = &g_dns_reqs[i];
+        if (d->stream_id && d->sess == s) {
+            free(d->rbuf);
+            memset(d, 0, sizeof(*d));
+            g_dns_active--;
+        }
+    }
+    if (g_dns_sess == s) g_dns_sess = NULL;
+
+    free(s->rx_buf);
+    free(s->tx_buf);
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+}
+
+static int can_create_session(time_t now) {
+    int live = 0, pending = 0;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!session_live(&g_sessions[i])) continue;
+        live++;
+        if (g_sessions[i].state != SESS_READY) pending++;
+    }
+    if (live >= g_max_sessions || now < g_next_connect) return 0;
+    /* While the server keeps failing, probe it with one connection at a time */
+    return !(g_backoff && pending);
+}
+
+/* Start a non-blocking connect; the handshake is driven from the event loop */
+static session_t *session_create(time_t now) {
+    session_t *s = NULL;
+    for (int i = 0; i < MAX_SESSIONS && !s; i++) {
+        if (g_sessions[i].state == SESS_FREE) s = &g_sessions[i];
+    }
+    if (!s) return NULL;
+
+    if (resolve_server(now) < 0) {
+        bump_backoff(now);
+        return NULL;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    set_nonblock(fd);
+    set_tcp_nodelay(fd);
+
+    /* Detect silently dropped connections (NAT timeouts, dead servers) */
+    int one = 1, idle = 30, intvl = 10, cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
+    memset(s, 0, sizeof(*s));
+    s->fd = fd;
+    s->state = SESS_CONNECTING;
+    s->seq = ++g_session_seq;
+    s->next_sid = 1;
+    s->created = s->idle_since = now;
+
+    printf("[anytls-tiny] Session %u: connecting to %s:%d (SNI: %s)\n", s->seq, g_server_host, g_server_port, g_sni);
+    fflush(stdout);
+
+    /* 1. Auth header: SHA256(password) + uint16(30) + 30 zero bytes */
+    if (tx_reserve(s, 64) < 0) {
+        s->broken = 1;
+        session_free(s, "out of memory");
+        return NULL;
+    }
+    uint8_t *auth = s->tx_buf;
+    p_SHA256((const unsigned char *)g_password, strlen(g_password), auth);
+    auth[32] = 0;
+    auth[33] = 30;
+    memset(auth + 34, 0, 30);
+    s->tx_len = 64;
+
+    /* 2. cmdSettings; both go out after the handshake in one TLS record with the first SYN */
+    static const char settings_data[] = "v=2\nclient=anytls/0.0.1\npadding-md5=00000000000000000000000000000000\n";
+    queue_frame(s, CMD_SETTINGS, 0, (const uint8_t *)settings_data, sizeof(settings_data) - 1);
+
+    if (connect(fd, (struct sockaddr *)&g_srv_addr, sizeof(g_srv_addr)) == 0) {
+        session_start_tls(s);
+    } else if (errno != EINPROGRESS) {
+        fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(errno));
+        s->broken = 1;
+    }
+    if (s->broken) {
+        session_free(s, "connect failed");
+        return NULL;
+    }
+    return s;
+}
+
+/*
+ * Pick a session for a new stream: the newest idle one (preferring sessions
+ * that are already up and not carrying DNS), else a new one, else the
+ * least-loaded live session.
+ */
+static session_t *acquire_session(time_t now) {
+    session_t *idle = NULL, *least = NULL;
+    int idle_rank = -1, least_load = 0;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        session_t *s = &g_sessions[i];
+        if (!session_live(s)) continue;
+        int load = s->nstreams + s->ndns;
+        if (load == 0) {
+            int rank = ((s->state == SESS_READY) << 1) | (s != g_dns_sess);
+            if (rank > idle_rank || (rank == idle_rank && s->seq > idle->seq)) {
+                idle = s;
+                idle_rank = rank;
+            }
+        }
+        if (!least || load < least_load ||
+            (load == least_load && s->state == SESS_READY && least->state != SESS_READY)) {
+            least = s;
+            least_load = load;
+        }
+    }
+    if (idle) return idle;
+    if (can_create_session(now)) {
+        session_t *s = session_create(now);
+        if (s) return s;
+    }
+    return least;
+}
+
+static stream_t *find_stream_by_id(session_t *s, uint32_t sid) {
     if (sid == 0) return NULL;
     for (int i = 0; i < MAX_STREAMS; i++) {
-        if (g_streams[i].client_fd > 0 && g_streams[i].stream_id == sid)
+        if (g_streams[i].client_fd > 0 && g_streams[i].sess == s && g_streams[i].stream_id == sid)
             return &g_streams[i];
     }
     return NULL;
@@ -329,22 +618,34 @@ static stream_t *alloc_stream(int client_fd, int is_redir) {
     return NULL;
 }
 
-/* Send cmdSYN + target address; stream IDs are assigned in SYN order */
+static void wbuf_account(stream_t *st, long delta) {
+    g_wbuf_total += delta;
+    if (st->sess) st->sess->wbuf_total += delta;
+}
+
+/* Bind the stream to a session and send cmdSYN + target address; IDs are assigned in SYN order */
 static int open_remote_stream(stream_t *st, const uint8_t *addr, int addr_len) {
-    st->stream_id = g_stream_counter;
-    g_stream_counter += 2; /* Client stream IDs are odd */
-    if (queue_frame(CMD_SYN, st->stream_id, NULL, 0) < 0) return -1;
-    return queue_frame(CMD_PSH, st->stream_id, addr, addr_len);
+    session_t *s = acquire_session(time(NULL));
+    if (!s) return -1;
+    st->sess = s;
+    s->nstreams++;
+    s->wbuf_total += st->wlen - st->woff;
+    st->stream_id = s->next_sid;
+    s->next_sid += 2; /* Client stream IDs are odd */
+    if (queue_frame(s, CMD_SYN, st->stream_id, NULL, 0) < 0) return -1;
+    return queue_frame(s, CMD_PSH, st->stream_id, addr, addr_len);
 }
 
 static void close_stream(stream_t *st) {
     if (!st || st->client_fd <= 0) return;
+    session_t *s = st->sess;
     /* Per spec, a stream closed by the server is not answered with FIN */
-    if (st->stream_id && !st->remote_fin) {
-        queue_frame(CMD_FIN, st->stream_id, NULL, 0);
+    if (s && st->stream_id && !st->remote_fin) {
+        queue_frame(s, CMD_FIN, st->stream_id, NULL, 0);
     }
     close(st->client_fd);
-    g_wbuf_total -= st->wlen - st->woff;
+    wbuf_account(st, -(long)(st->wlen - st->woff));
+    if (s) session_unref(s, 0);
     free(st->wbuf);
     memset(st, 0, sizeof(*st));
     st->client_fd = -1;
@@ -378,7 +679,7 @@ static int stream_write(stream_t *st, const uint8_t *data, int len) {
     }
     memcpy(st->wbuf + st->wlen, data, len);
     st->wlen += len;
-    g_wbuf_total += len;
+    wbuf_account(st, len);
     return 0;
 }
 
@@ -387,7 +688,7 @@ static void stream_flush(stream_t *st) {
         int n = send(st->client_fd, st->wbuf + st->woff, st->wlen - st->woff, MSG_NOSIGNAL);
         if (n > 0) {
             st->woff += n;
-            g_wbuf_total -= n;
+            wbuf_account(st, -n);
             st->wprogress = time(NULL);
             continue;
         }
@@ -405,174 +706,36 @@ static void stream_flush(stream_t *st) {
     if (st->remote_fin) close_stream(st);
 }
 
-/* Backpressure: stop reading the tunnel while LAN clients are too far behind */
-static int rx_paused(void) {
-    if (g_wbuf_total <= WBUF_STREAM_MAX) return 0;
+/*
+ * Backpressure: stop reading a session while its LAN clients are too far
+ * behind. Only that session pauses; the others keep flowing.
+ */
+static int rx_paused(const session_t *s) {
+    if (s->wbuf_total <= WBUF_STREAM_MAX) return 0;
     if (g_wbuf_total > WBUF_TOTAL_MAX) return 1;
     for (int i = 0; i < MAX_STREAMS; i++) {
-        if (g_streams[i].client_fd > 0 && g_streams[i].wlen - g_streams[i].woff > WBUF_STREAM_MAX)
+        if (g_streams[i].client_fd > 0 && g_streams[i].sess == s &&
+            g_streams[i].wlen - g_streams[i].woff > WBUF_STREAM_MAX)
             return 1;
     }
     return 0;
 }
 
-static dns_req_t *find_dns_req(uint32_t sid) {
+static dns_req_t *find_dns_req(session_t *s, uint32_t sid) {
     if (!g_dns_active || sid == 0) return NULL;
     for (int i = 0; i < MAX_DNS_REQS; i++) {
-        if (g_dns_reqs[i].stream_id == sid) return &g_dns_reqs[i];
+        if (g_dns_reqs[i].stream_id == sid && g_dns_reqs[i].sess == s) return &g_dns_reqs[i];
     }
     return NULL;
 }
 
 static void release_dns_req(dns_req_t *d, int send_fin) {
     if (!d->stream_id) return;
-    if (send_fin) queue_frame(CMD_FIN, d->stream_id, NULL, 0);
+    if (send_fin) queue_frame(d->sess, CMD_FIN, d->stream_id, NULL, 0);
+    session_unref(d->sess, 1);
     free(d->rbuf);
     memset(d, 0, sizeof(*d));
     g_dns_active--;
-}
-
-static void close_all_streams(void) {
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        if (g_streams[i].client_fd > 0) {
-            close(g_streams[i].client_fd);
-            free(g_streams[i].wbuf);
-            memset(&g_streams[i], 0, sizeof(g_streams[i]));
-            g_streams[i].client_fd = -1;
-        }
-    }
-    g_wbuf_total = 0;
-    for (int i = 0; i < MAX_DNS_REQS; i++) {
-        release_dns_req(&g_dns_reqs[i], 0);
-    }
-}
-
-static void bump_backoff(time_t now) {
-    g_backoff = g_backoff ? (g_backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : g_backoff * 2) : 1;
-    g_next_connect = now + g_backoff;
-}
-
-static void disconnect_upstream(void) {
-    if (g_ssl) {
-        p_SSL_shutdown(g_ssl);
-        p_SSL_free(g_ssl);
-        g_ssl = NULL;
-    }
-    if (g_ssl_fd >= 0) {
-        close(g_ssl_fd);
-        g_ssl_fd = -1;
-    }
-    /* A session that dies right after connecting (e.g. wrong password) also backs off */
-    time_t now = time(NULL);
-    if (g_connected_at && now - g_connected_at < 10) bump_backoff(now);
-    g_connected_at = 0;
-    g_upstream_broken = 0;
-    g_peer_version = 0;
-    g_rx_len = 0;
-    g_rx_kick = 0;
-    g_rx_want_write = 0;
-    g_tx_off = g_tx_len = g_tx_inflight = 0;
-    g_tx_want_write = 0;
-    close_all_streams();
-}
-
-static int connect_upstream(void) {
-    time_t now = time(NULL);
-    if (now < g_next_connect) return -1;
-
-    disconnect_upstream();
-    printf("[anytls-tiny] Connecting to upstream %s:%d (SNI: %s)...\n", g_server_host, g_server_port, g_sni);
-    fflush(stdout);
-
-    /* Assume failure until the handshake completes */
-    bump_backoff(now);
-
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", g_server_port);
-
-    if (getaddrinfo(g_server_host, port_str, &hints, &res) != 0 || !res) {
-        fprintf(stderr, "[anytls-tiny] Failed to resolve %s\n", g_server_host);
-        return -1;
-    }
-
-    g_ssl_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (g_ssl_fd < 0) {
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    /* Bounds the blocking connect + handshake below */
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(g_ssl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(g_ssl_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    set_tcp_nodelay(g_ssl_fd);
-
-    /* Detect silently dropped connections (NAT timeouts, dead servers) */
-    int one = 1, idle = 30, intvl = 10, cnt = 3;
-    setsockopt(g_ssl_fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-    setsockopt(g_ssl_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    setsockopt(g_ssl_fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-    setsockopt(g_ssl_fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-
-    if (connect(g_ssl_fd, res->ai_addr, res->ai_addrlen) < 0) {
-        perror("[anytls-tiny] Connect error");
-        close(g_ssl_fd);
-        g_ssl_fd = -1;
-        freeaddrinfo(res);
-        return -1;
-    }
-    freeaddrinfo(res);
-
-    g_ssl = p_SSL_new(g_ssl_ctx);
-    if (!g_ssl) {
-        disconnect_upstream();
-        return -1;
-    }
-    p_SSL_set_fd(g_ssl, g_ssl_fd);
-    p_SSL_ctrl(g_ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, g_sni);
-    p_SSL_ctrl(g_ssl, SSL_CTRL_MODE, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, NULL);
-
-    /* ALPN: h2, http/1.1 */
-    const unsigned char alpn[] = { 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-    p_SSL_set_alpn_protos(g_ssl, alpn, sizeof(alpn));
-
-    if (p_SSL_connect(g_ssl) <= 0) {
-        fprintf(stderr, "[anytls-tiny] SSL_connect failed\n");
-        disconnect_upstream();
-        return -1;
-    }
-
-    printf("[anytls-tiny] TLS handshake successful!\n");
-    fflush(stdout);
-
-    /* 1. Auth Header: SHA256(password) + uint16(30) + 30 zero bytes, sent on its own */
-    uint8_t auth[32 + 2 + 30];
-    p_SHA256((const unsigned char *)g_password, strlen(g_password), auth);
-    auth[32] = 0;
-    auth[33] = 30;
-    memset(auth + 34, 0, 30);
-
-    if (p_SSL_write(g_ssl, auth, sizeof(auth)) <= 0) {
-        disconnect_upstream();
-        return -1;
-    }
-
-    set_nonblock(g_ssl_fd);
-    g_rx_len = 0;
-    g_connected_at = g_last_rx = g_last_hb = now;
-
-    /* 2. cmdSettings is queued so it shares a TLS record with the first SYN */
-    static const char settings_data[] = "v=2\nclient=anytls/0.0.1\npadding-md5=00000000000000000000000000000000\n";
-    queue_frame(CMD_SETTINGS, 0, (const uint8_t *)settings_data, sizeof(settings_data) - 1);
-
-    printf("[anytls-tiny] AnyTLS Auth + Settings sent successfully! Ready for traffic.\n");
-    fflush(stdout);
-    g_next_connect = 0;
-    return 0;
 }
 
 static int bind_listener(int type, const char *addr, int port) {
@@ -610,11 +773,6 @@ static void handle_new_connection(int listen_fd, int is_redir) {
 
         set_nonblock(cfd);
         set_tcp_nodelay(cfd);
-
-        if (!g_ssl && connect_upstream() < 0) {
-            close(cfd);
-            continue;
-        }
 
         stream_t *st = alloc_stream(cfd, is_redir);
         if (!st) {
@@ -681,7 +839,13 @@ static void handle_socks_handshake(stream_t *st) {
     }
     if (n < 3 + saddr_len) { close_stream(st); return; }
 
-    if (open_remote_stream(st, saddr, saddr_len) < 0 || stream_write(st, resp, 10) < 0) {
+    if (open_remote_stream(st, saddr, saddr_len) < 0) {
+        resp[1] = 0x01; /* general failure: no session to the server */
+        stream_write(st, resp, 10);
+        close_stream(st);
+        return;
+    }
+    if (stream_write(st, resp, 10) < 0) {
         close_stream(st);
         return;
     }
@@ -689,7 +853,7 @@ static void handle_socks_handshake(stream_t *st) {
 
     /* Forward any early data the client sent along with the request */
     int rest = n - 3 - saddr_len;
-    if (rest > 0 && queue_frame(CMD_PSH, st->stream_id, saddr + saddr_len, rest) < 0) {
+    if (rest > 0 && queue_frame(st->sess, CMD_PSH, st->stream_id, saddr + saddr_len, rest) < 0) {
         close_stream(st);
     }
 }
@@ -701,10 +865,10 @@ static void handle_client_data(stream_t *st) {
     }
 
     /* Bounded per pass so one bulk upload can't starve other clients */
-    for (int k = 0; k < 4 && tx_pending() < TX_HIGH_WATER; k++) {
+    for (int k = 0; k < 4 && tx_pending(st->sess) < TX_HIGH_WATER; k++) {
         int n = recv(st->client_fd, g_client_rx_buf, sizeof(g_client_rx_buf), 0);
         if (n > 0) {
-            if (queue_frame(CMD_PSH, st->stream_id, g_client_rx_buf, n) < 0) {
+            if (queue_frame(st->sess, CMD_PSH, st->stream_id, g_client_rx_buf, n) < 0) {
                 close_stream(st);
                 return;
             }
@@ -727,8 +891,6 @@ static void handle_dns_udp_query(void) {
     int n = recvfrom(g_dns_fd, buf + 2, sizeof(buf) - 2, 0, (struct sockaddr *)&cli, &clen);
     if (n <= 12) return;
 
-    if (!g_ssl && connect_upstream() < 0) return;
-
     dns_req_t *d = NULL;
     for (int i = 0; i < MAX_DNS_REQS; i++) {
         if (!g_dns_reqs[i].stream_id) {
@@ -738,18 +900,32 @@ static void handle_dns_udp_query(void) {
     }
     if (!d) return;
 
-    d->stream_id = g_stream_counter;
-    g_stream_counter += 2;
+    /* Queries share one session; they move off it when a TCP stream lands
+     * there, but only to an idle or new session, not round the busy ones */
+    time_t now = time(NULL);
+    session_t *s = g_dns_sess;
+    if (s && !session_live(s)) s = NULL;
+    if (!s || s->nstreams > 0) {
+        session_t *n = acquire_session(now);
+        if (n && (!s || n->nstreams == 0)) s = n;
+    }
+    g_dns_sess = s;
+    if (!s) return;
+
+    d->sess = s;
+    s->ndns++;
+    d->stream_id = s->next_sid;
+    s->next_sid += 2;
     d->client_addr = cli;
-    d->expire = time(NULL) + DNS_TIMEOUT;
+    d->expire = now + DNS_TIMEOUT;
     g_dns_active++;
 
     /* One stream per query to the configured resolver, query sent with 2-byte length prefix */
     buf[0] = (n >> 8) & 0xFF;
     buf[1] = n & 0xFF;
-    if (queue_frame(CMD_SYN, d->stream_id, NULL, 0) < 0 ||
-        queue_frame(CMD_PSH, d->stream_id, g_dns_target, sizeof(g_dns_target)) < 0 ||
-        queue_frame(CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
+    if (queue_frame(s, CMD_SYN, d->stream_id, NULL, 0) < 0 ||
+        queue_frame(s, CMD_PSH, d->stream_id, g_dns_target, sizeof(g_dns_target)) < 0 ||
+        queue_frame(s, CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
         release_dns_req(d, 0);
     }
 }
@@ -782,21 +958,21 @@ static void handle_dns_data(dns_req_t *d, const uint8_t *data, int len) {
     }
 }
 
-static void handle_frame(uint8_t cmd, uint32_t sid, const uint8_t *data, int len) {
+static void handle_frame(session_t *s, uint8_t cmd, uint32_t sid, const uint8_t *data, int len) {
     dns_req_t *d;
     stream_t *st;
 
     switch (cmd) {
     case CMD_PSH:
-        if ((d = find_dns_req(sid))) {
+        if ((d = find_dns_req(s, sid))) {
             handle_dns_data(d, data, len);
-        } else if ((st = find_stream_by_id(sid)) && !st->remote_fin) {
+        } else if ((st = find_stream_by_id(s, sid)) && !st->remote_fin) {
             if (stream_write(st, data, len) < 0) close_stream(st);
         }
         break;
     case CMD_FIN:
-        if ((d = find_dns_req(sid))) release_dns_req(d, 0);
-        if ((st = find_stream_by_id(sid))) {
+        if ((d = find_dns_req(s, sid))) release_dns_req(d, 0);
+        if ((st = find_stream_by_id(s, sid))) {
             st->remote_fin = 1;
             if (st->woff == st->wlen) close_stream(st);
         }
@@ -806,24 +982,24 @@ static void handle_frame(uint8_t cmd, uint32_t sid, const uint8_t *data, int len
         if (len > 0) {
             printf("[anytls-tiny] Stream %u rejected by server: %.*s\n", sid, len > 200 ? 200 : len, (const char *)data);
             fflush(stdout);
-            if ((d = find_dns_req(sid))) release_dns_req(d, 1);
-            if ((st = find_stream_by_id(sid))) close_stream(st);
+            if ((d = find_dns_req(s, sid))) release_dns_req(d, 1);
+            if ((st = find_stream_by_id(s, sid))) close_stream(st);
         }
         break;
     case CMD_HEART_REQ:
-        queue_frame(CMD_HEART_RESP, sid, NULL, 0);
+        queue_frame(s, CMD_HEART_RESP, sid, NULL, 0);
         break;
     case CMD_SERVER_SETTINGS:
         for (int i = 0; i + 2 < len; i++) {
             if ((i == 0 || data[i - 1] == '\n') && data[i] == 'v' && data[i + 1] == '=') {
-                g_peer_version = atoi((const char *)data + i + 2);
+                s->peer_version = atoi((const char *)data + i + 2);
                 break;
             }
         }
         break;
     case CMD_ALERT:
         fprintf(stderr, "[anytls-tiny] Alert from server: %.*s\n", len > 200 ? 200 : len, (const char *)data);
-        g_upstream_broken = 1;
+        s->broken = 1;
         break;
     default:
         /* cmdWaste, cmdUpdatePaddingScheme, cmdHeartResponse: nothing to do */
@@ -832,76 +1008,120 @@ static void handle_frame(uint8_t cmd, uint32_t sid, const uint8_t *data, int len
 }
 
 /* Parse all complete frames in the RX buffer; returns -1 if parsing had to stop early */
-static int parse_rx_frames(void) {
+static int parse_rx_frames(session_t *s) {
     int off = 0, ret = 0;
-    while (g_rx_len - off >= FRAME_HDR) {
-        if (rx_paused()) { ret = -1; break; }
-        const uint8_t *h = g_rx_buf + off;
+    while (s->rx_len - off >= FRAME_HDR) {
+        if (rx_paused(s)) { ret = -1; break; }
+        const uint8_t *h = s->rx_buf + off;
         uint32_t sid = ((uint32_t)h[1] << 24) | ((uint32_t)h[2] << 16) |
                        ((uint32_t)h[3] << 8)  | (uint32_t)h[4];
         int flen = (h[5] << 8) | h[6];
-        if (g_rx_len - off < FRAME_HDR + flen) break;
+        if (s->rx_len - off < FRAME_HDR + flen) break;
 
-        handle_frame(h[0], sid, h + FRAME_HDR, flen);
+        handle_frame(s, h[0], sid, h + FRAME_HDR, flen);
         off += FRAME_HDR + flen;
-        if (g_upstream_broken) return -1;
+        if (s->broken) return -1;
     }
     if (off > 0) {
-        memmove(g_rx_buf, g_rx_buf + off, g_rx_len - off);
-        g_rx_len -= off;
+        memmove(s->rx_buf, s->rx_buf + off, s->rx_len - off);
+        s->rx_len -= off;
     }
     return ret;
 }
 
-static void handle_upstream_data(void) {
-    g_rx_kick = 0;
-    g_rx_want_write = 0;
-    /* Drain several TLS records per wakeup instead of one per poll() */
-    for (int iter = 0; iter < 16; iter++) {
-        if (parse_rx_frames() < 0) {
-            if (!g_upstream_broken) g_rx_kick = 1;
-            return;
-        }
-        /* After parsing only a partial frame (< 64 KB) remains, so there is always room */
-        int n = p_SSL_read(g_ssl, g_rx_buf + g_rx_len, RX_BUF_SIZE - g_rx_len);
-        if (n <= 0) {
-            int err = p_SSL_get_error(g_ssl, n);
-            if (err == SSL_ERROR_WANT_READ) return;
-            if (err == SSL_ERROR_WANT_WRITE) { g_rx_want_write = 1; return; }
-            printf("[anytls-tiny] Upstream SSL disconnected (err=%d)\n", err);
-            fflush(stdout);
-            g_upstream_broken = 1;
-            return;
-        }
-        g_rx_len += n;
-        g_last_rx = time(NULL);
-    }
-    g_rx_kick = 1;
-}
-
-/* Once-a-second housekeeping: heartbeats, dead-session detection, timeouts */
-static void periodic_tick(time_t now) {
-    if (!g_ssl) {
-        if (now >= g_next_connect) connect_upstream();
+static void handle_upstream_data(session_t *s) {
+    s->rx_kick = 0;
+    s->rx_want_write = 0;
+    if (!s->rx_buf && !(s->rx_buf = malloc(RX_BUF_SIZE))) {
+        s->broken = 1;
         return;
     }
-
-    /* Only a session that stays up resets the reconnect backoff */
-    if (g_backoff && now - g_connected_at >= 10) g_backoff = 0;
-
-    int paused = rx_paused();
-    if (paused) g_last_rx = now; /* unread data is waiting in the kernel, the session is alive */
-
-    if (g_peer_version >= 2) {
-        if (now - g_last_rx >= HEARTBEAT_IDLE && now - g_last_hb >= HEARTBEAT_IDLE) {
-            queue_frame(CMD_HEART_REQ, 0, NULL, 0);
-            g_last_hb = now;
-        }
-        if (now - g_last_rx >= DEAD_TIMEOUT) {
-            printf("[anytls-tiny] No data from server for %ds, reconnecting\n", DEAD_TIMEOUT);
-            fflush(stdout);
-            g_upstream_broken = 1;
+    /* Drain several TLS records per wakeup instead of one per poll() */
+    for (int iter = 0; iter < 16; iter++) {
+        if (parse_rx_frames(s) < 0) {
+            if (!s->broken) s->rx_kick = 1;
             return;
+        }
+        /* After parsing only a partial frame (< RX_BUF_SIZE) remains, so there is always room */
+        clear_ssl_errors();
+        int n = p_SSL_read(s->ssl, s->rx_buf + s->rx_len, RX_BUF_SIZE - s->rx_len);
+        if (n <= 0) {
+            int err = p_SSL_get_error(s->ssl, n);
+            if (err == SSL_ERROR_WANT_READ) return;
+            if (err == SSL_ERROR_WANT_WRITE) { s->rx_want_write = 1; return; }
+            printf("[anytls-tiny] Session %u: upstream disconnected (err=%d)\n", s->seq, err);
+            fflush(stdout);
+            s->broken = 1;
+            return;
+        }
+        s->rx_len += n;
+        s->last_rx = time(NULL);
+    }
+    s->rx_kick = 1;
+}
+
+/* Close idle sessions past the timeout, keeping the newest g_min_idle of them */
+static void expire_idle_sessions(time_t now) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        session_t *s = &g_sessions[i];
+        if (s->state != SESS_READY || s->broken || s->nstreams + s->ndns > 0) continue;
+        if (now - s->idle_since < g_idle_timeout) continue;
+        int newer = 0;
+        for (int j = 0; j < MAX_SESSIONS; j++) {
+            session_t *o = &g_sessions[j];
+            if (o->state == SESS_READY && !o->broken && o->nstreams + o->ndns == 0 && o->seq > s->seq)
+                newer++;
+        }
+        if (newer >= g_min_idle) session_free(s, "idle");
+    }
+}
+
+/* Once-a-second housekeeping: heartbeats, dead-session detection, timeouts, idle pool */
+static void periodic_tick(time_t now) {
+    static time_t last_idle_check = 0;
+    int live = 0;
+
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        session_t *s = &g_sessions[i];
+        if (!session_live(s)) continue;
+        live++;
+
+        if (s->state != SESS_READY) {
+            if (now - s->created >= CONNECT_TIMEOUT) {
+                fprintf(stderr, "[anytls-tiny] Session %u: connect/handshake timed out\n", s->seq);
+                s->broken = 1;
+            }
+            continue;
+        }
+
+        /* Only a session that came up after the last failure and stays up resets the backoff */
+        if (g_backoff && s->ready_at >= g_last_fail && now - s->ready_at >= 10) g_backoff = 0;
+
+        if (rx_paused(s)) s->last_rx = now; /* unread data is waiting in the kernel, the session is alive */
+
+        if (s->peer_version >= 2) {
+            if (now - s->last_rx >= HEARTBEAT_IDLE && now - s->last_hb >= HEARTBEAT_IDLE) {
+                queue_frame(s, CMD_HEART_REQ, 0, NULL, 0);
+                s->last_hb = now;
+            }
+            if (now - s->last_rx >= DEAD_TIMEOUT) {
+                printf("[anytls-tiny] Session %u: no data from server for %ds\n", s->seq, DEAD_TIMEOUT);
+                fflush(stdout);
+                s->broken = 1;
+                continue;
+            }
+        }
+
+        /* Idle sessions give their buffers back */
+        if (s->nstreams + s->ndns == 0) {
+            if (s->rx_buf && s->rx_len == 0 && !s->rx_kick) {
+                free(s->rx_buf);
+                s->rx_buf = NULL;
+            }
+            if (s->tx_buf && s->tx_len == 0) {
+                free(s->tx_buf);
+                s->tx_buf = NULL;
+            }
         }
     }
 
@@ -910,7 +1130,7 @@ static void periodic_tick(time_t now) {
             release_dns_req(&g_dns_reqs[i], 1);
     }
 
-    /* Drop clients that stopped reading: they would otherwise stall every other stream */
+    /* Drop clients that stopped reading: they would otherwise stall their session */
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *st = &g_streams[i];
         int pending = st->wlen - st->woff;
@@ -920,6 +1140,14 @@ static void periodic_tick(time_t now) {
             close_stream(st);
         }
     }
+
+    if (now - last_idle_check >= IDLE_CHECK_INTERVAL) {
+        last_idle_check = now;
+        expire_idle_sessions(now);
+    }
+
+    /* Keep a session warm (or keep retrying) while the pool is empty */
+    if (live == 0 && g_min_idle > 0 && now >= g_next_connect) session_create(now);
 }
 
 static int parse_dns_target(const char *s) {
@@ -955,12 +1183,15 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -u <port>       DNS-over-TCP UDP listening port (default: 5353, 0 = off)\n");
     fprintf(stderr, "  -n <ip[:port]>  DNS resolver reached through the tunnel (default: 8.8.8.8:53)\n");
     fprintf(stderr, "  -b <ip>         Listen address for SOCKS5 and DNS (default: 0.0.0.0)\n");
+    fprintf(stderr, "  -m <n>          Max TLS sessions to the server (1-%d, default: 8)\n", MAX_SESSIONS);
+    fprintf(stderr, "  -i <seconds>    Close sessions idle for this long (default: 60)\n");
+    fprintf(stderr, "  -w <n>          Idle sessions kept open past the timeout (default: 1)\n");
     fprintf(stderr, "  -d              Run as background daemon\n");
 }
 
 int main(int argc, char **argv) {
     int opt, daemonize = 0;
-    while ((opt = getopt(argc, argv, "s:p:k:h:l:r:u:n:b:d")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:k:h:l:r:u:n:b:m:i:w:d")) != -1) {
         switch (opt) {
             case 's': strncpy(g_server_host, optarg, sizeof(g_server_host)-1); break;
             case 'p': g_server_port = atoi(optarg); break;
@@ -976,6 +1207,9 @@ int main(int argc, char **argv) {
                 }
                 break;
             case 'b': strncpy(g_bind_addr, optarg, sizeof(g_bind_addr)-1); break;
+            case 'm': g_max_sessions = atoi(optarg); break;
+            case 'i': g_idle_timeout = atoi(optarg); break;
+            case 'w': g_min_idle = atoi(optarg); break;
             case 'd': daemonize = 1; break;
             default:
                 print_usage(argv[0]);
@@ -986,6 +1220,10 @@ int main(int argc, char **argv) {
     if (g_server_host[0] == '\0' || g_password[0] == '\0') {
         fprintf(stderr, "[anytls-tiny] Error: Server (-s) and password (-k) are required.\n\n");
         print_usage(argv[0]);
+        return 1;
+    }
+    if (g_max_sessions < 1 || g_max_sessions > MAX_SESSIONS || g_idle_timeout < 1 || g_min_idle < 0) {
+        fprintf(stderr, "[anytls-tiny] Error: -m must be 1-%d, -i at least 1, -w at least 0.\n", MAX_SESSIONS);
         return 1;
     }
 
@@ -1023,39 +1261,60 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[anytls-tiny] Started! SOCKS5:%d, Redir:%d, DNS-UDP:%d\n", g_socks_port, g_redir_port, g_dns_port);
+    printf("[anytls-tiny] Started! SOCKS5:%d, Redir:%d, DNS-UDP:%d, max sessions:%d\n",
+           g_socks_port, g_redir_port, g_dns_port, g_max_sessions);
     fflush(stdout);
 
-    connect_upstream();
+    for (int i = 0; i < MAX_SESSIONS; i++) g_sessions[i].fd = -1;
     time_t last_tick = time(NULL);
+    if (g_min_idle > 0) session_create(last_tick);
 
-    struct pollfd fds[MAX_STREAMS + 4];
-    int stream_map[MAX_STREAMS + 4];
+    enum { NFIXED = 3, NFDS = NFIXED + MAX_SESSIONS + MAX_STREAMS };
+    struct pollfd fds[NFDS];
+    int fd_map[NFDS];
+    uint32_t fd_seq[NFDS];
 
     while (1) {
-        /* Fixed slots 0-3; poll() ignores entries whose fd is -1 */
-        int paused = rx_paused();
+        /* Fixed slots 0-2; poll() ignores entries whose fd is -1 */
         fds[0].fd = socks_fd; fds[0].events = POLLIN;
         fds[1].fd = redir_fd; fds[1].events = POLLIN;
         fds[2].fd = g_dns_fd; fds[2].events = POLLIN;
-        fds[3].fd = g_ssl ? g_ssl_fd : -1;
-        fds[3].events = (paused ? 0 : POLLIN) | (g_tx_want_write || g_rx_want_write ? POLLOUT : 0);
-        int nfds = 4;
+        int nfds = NFIXED, kick = 0;
 
-        int tx_full = tx_pending() >= TX_HIGH_WATER;
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &g_sessions[i];
+            if (!session_live(s)) continue;
+            short ev;
+            if (s->state == SESS_CONNECTING) {
+                ev = POLLOUT;
+            } else if (s->state == SESS_HANDSHAKE) {
+                ev = s->rx_want_write ? POLLOUT : POLLIN;
+            } else {
+                int paused = rx_paused(s);
+                ev = (paused ? 0 : POLLIN) | (s->tx_want_write || s->rx_want_write ? POLLOUT : 0);
+                if (s->rx_kick && !paused) kick = 1;
+            }
+            fd_map[nfds] = i;
+            fd_seq[nfds] = s->seq;
+            fds[nfds].fd = s->fd;
+            fds[nfds].events = ev;
+            nfds++;
+        }
+        int sess_end = nfds;
+
         for (int i = 0; i < MAX_STREAMS; i++) {
             stream_t *st = &g_streams[i];
             if (st->client_fd <= 0) continue;
             short ev = 0;
-            if (!st->remote_fin && !tx_full) ev |= POLLIN;
+            if (!st->remote_fin && (!st->sess || tx_pending(st->sess) < TX_HIGH_WATER)) ev |= POLLIN;
             if (st->woff < st->wlen) ev |= POLLOUT;
-            stream_map[nfds] = i;
+            fd_map[nfds] = i;
             fds[nfds].fd = st->client_fd;
             fds[nfds].events = ev;
             nfds++;
         }
 
-        int ret = poll(fds, nfds, (g_rx_kick && !paused && g_ssl) ? 0 : 1000);
+        int ret = poll(fds, nfds, kick ? 0 : 1000);
         if (ret < 0 && errno != EINTR) {
             perror("poll");
             return 1;
@@ -1074,20 +1333,30 @@ int main(int argc, char **argv) {
             if (fds[2].revents & POLLIN) handle_dns_udp_query();
         }
 
-        if (g_ssl && fds[3].fd == g_ssl_fd) {
-            short re = fds[3].revents;
-            if (re & POLLOUT) flush_tx();
-            if (paused && (re & (POLLERR | POLLHUP))) {
-                g_upstream_broken = 1;
-            } else if ((re & (POLLIN | POLLERR | POLLHUP)) || (g_rx_kick && !paused) ||
-                       (g_rx_want_write && (re & POLLOUT))) {
-                handle_upstream_data();
+        for (int j = NFIXED; j < sess_end; j++) {
+            session_t *s = &g_sessions[fd_map[j]];
+            /* The slot may have been freed (and reused) earlier in this pass */
+            if (!session_live(s) || s->seq != fd_seq[j]) continue;
+            short re = fds[j].revents;
+            if (s->state == SESS_CONNECTING) {
+                if (re) session_connected(s);
+            } else if (s->state == SESS_HANDSHAKE) {
+                if (re) session_handshake(s);
+            } else {
+                int paused = rx_paused(s);
+                if (re & POLLOUT) flush_tx(s);
+                if (paused && (re & (POLLERR | POLLHUP))) {
+                    s->broken = 1;
+                } else if ((re & (POLLIN | POLLERR | POLLHUP)) || (s->rx_kick && !paused) ||
+                           (s->rx_want_write && (re & POLLOUT))) {
+                    handle_upstream_data(s);
+                }
             }
         }
 
         if (ret > 0) {
-            for (int j = 4; j < nfds; j++) {
-                stream_t *st = &g_streams[stream_map[j]];
+            for (int j = sess_end; j < nfds; j++) {
+                stream_t *st = &g_streams[fd_map[j]];
                 /* The slot may have been closed earlier in this pass */
                 if (!fds[j].revents || st->client_fd != fds[j].fd) continue;
                 if (fds[j].revents & POLLOUT) stream_flush(st);
@@ -1097,8 +1366,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (!g_upstream_broken) flush_tx();
-        if (g_upstream_broken) disconnect_upstream();
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            session_t *s = &g_sessions[i];
+            if (s->state == SESS_FREE) continue;
+            flush_tx(s);
+            if (s->broken) session_free(s, "error");
+        }
     }
 
     return 0;
