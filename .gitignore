@@ -1,0 +1,22 @@
+# Binaries and build artifacts
+anytls-tiny
+*.o
+*.a
+*.so
+*.ipk
+*.apk
+build/
+bin/
+
+# Temporary and local config files
+*.local
+*.secret
+*.log
+chnroute.txt
+20-anytls.nft
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

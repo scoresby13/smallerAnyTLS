@@ -1,0 +1,31 @@
+# Example OpenWrt firewall4 (nftables) transparent proxy configuration.
+# Place in /etc/nftables.d/20-anytls.nft and reload with: fw4 reload
+
+# Note: Populate the 'chnroute' set using scripts/gen-nft-chnroute.py
+# or your own delegated IP list.
+
+set chnroute {
+    type ipv4_addr
+    flags interval
+    elements = {
+        1.0.1.0/24,
+        1.0.2.0/23,
+        1.0.8.0/21
+    }
+}
+
+chain dstnat_anytls {
+    type nat hook prerouting priority dstnat - 1; policy accept;
+    
+    # Only redirect traffic arriving from local LAN / Wi-Fi
+    iifname != "br-lan" return
+    
+    # Bypass domestic IP ranges
+    ip daddr @chnroute return
+    
+    # Bypass private and local networks
+    ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
+    
+    # Redirect all other outbound TCP traffic to anytls-tiny redir port
+    meta l4proto tcp redirect to :1100
+}
