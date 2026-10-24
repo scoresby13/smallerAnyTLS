@@ -1,12 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=anytls-tiny
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
-
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/scoresby13/smallerAnyTLS.git
-PKG_MIRROR:=0
 
 PKG_MAINTAINER:=scoresby13
 PKG_LICENSE:=MIT
@@ -18,7 +14,7 @@ define Package/anytls-tiny
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
-  TITLE:=Ultra-lightweight AnyTLS v2 Client (~15 KB)
+  TITLE:=Ultra-lightweight AnyTLS v2 Client
   URL:=https://github.com/scoresby13/smallerAnyTLS
   DEPENDS:=+libopenssl
 endef
@@ -29,8 +25,20 @@ define Package/anytls-tiny/description
   Includes SOCKS5, transparent TCP redirect, and anti-poisoning DNS forwarder.
 endef
 
+define Package/anytls-tiny/conffiles
+/etc/config/anytls
+endef
+
+# Builds from this repository's src/ (link this directory into the SDK's package/ tree)
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)/src
+	$(CP) $(CURDIR)/../src/anytls-tiny.c $(PKG_BUILD_DIR)/src/
+	$(CP) $(CURDIR)/../LICENSE $(PKG_BUILD_DIR)/
+endef
+
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CFLAGS) -Os -pipe -s \
+		-fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Wl,--gc-sections \
 		$(PKG_BUILD_DIR)/src/anytls-tiny.c \
 		-ldl -o $(PKG_BUILD_DIR)/anytls-tiny
 endef

@@ -1,5 +1,7 @@
 CC ?= gcc
-CFLAGS ?= -Os -pipe -Wall -Wextra -fomit-frame-pointer
+CFLAGS ?= -Os -pipe -Wall -Wextra -fomit-frame-pointer \
+	-fno-asynchronous-unwind-tables -fno-unwind-tables \
+	-ffunction-sections -fdata-sections -Wl,--gc-sections
 LDFLAGS ?= -ldl
 TARGET = anytls-tiny
 SRC = src/anytls-tiny.c

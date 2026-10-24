@@ -7,3 +7,7 @@ config anytls 'main'
 	option socks_port '1080'
 	option redir_port '1100'
 	option dns_port '5353'
+	# Resolver queried through the tunnel (IPv4[:port])
+	option dns_server '8.8.8.8:53'
+	# Listen address for SOCKS5 and DNS; use '127.0.0.1' if only the router needs them
+	option listen_addr '0.0.0.0'

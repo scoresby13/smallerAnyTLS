@@ -31,13 +31,15 @@ def main():
         out.write("    }\n")
         out.write("}\n\n")
 
-        bypass_ips = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+        bypass_ips = ("0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, "
+                      "172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4")
         if server_ip:
             bypass_ips += f", {server_ip}"
 
         out.write("chain dstnat_anytls {\n")
         out.write("    type nat hook prerouting priority dstnat - 1; policy accept;\n")
         out.write("    iifname != \"br-lan\" return\n")
+        out.write("    meta nfproto != ipv4 return\n")
         out.write("    ip daddr @chnroute return\n")
         out.write(f"    ip daddr {{ {bypass_ips} }} return\n")
         out.write("    meta l4proto tcp redirect to :1100\n")
