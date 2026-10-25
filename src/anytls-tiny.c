@@ -68,6 +68,9 @@
 #define DEAD_TIMEOUT 45
 #define DNS_TIMEOUT 6
 #define MAX_BACKOFF 30
+/* Padding: max records per packet, largest record size */
+#define PAD_MAX_REC 16
+#define PAD_MAX_SIZE 16384
 /* TCP connect + TLS handshake must finish within this many seconds */
 #define CONNECT_TIMEOUT 10
 #define IDLE_CHECK_INTERVAL 30
@@ -96,6 +99,9 @@ static int (*p_SSL_get_error)(const SSL*, int);
 static int (*p_SSL_shutdown)(SSL*);
 static void (*p_SSL_free)(SSL*);
 static unsigned char* (*p_SHA256)(const unsigned char*, size_t, unsigned char*);
+static int (*p_RAND_bytes)(unsigned char*, int);
+static int (*p_EVP_Digest)(const void*, size_t, unsigned char*, unsigned int*, const void*, void*);
+static const void* (*p_EVP_md5)(void);
 static void (*p_ERR_clear_error)(void);
 
 #define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
@@ -157,12 +163,15 @@ static int init_openssl(void) {
     p_SSL_shutdown = dlsym(h_ssl, "SSL_shutdown");
     p_SSL_free = dlsym(h_ssl, "SSL_free");
     p_SHA256 = dlsym(h_crypto, "SHA256");
+    p_RAND_bytes = dlsym(h_crypto, "RAND_bytes");
+    p_EVP_Digest = dlsym(h_crypto, "EVP_Digest");
+    p_EVP_md5 = dlsym(h_crypto, "EVP_md5");
     p_ERR_clear_error = dlsym(h_crypto, "ERR_clear_error");
 
     if (!p_TLS_client_method || !p_SSL_CTX_new || !p_SSL_CTX_set_verify || !p_SSL_new ||
         !p_SSL_set_fd || !p_SSL_ctrl || !p_SSL_set_alpn_protos || !p_SSL_connect ||
         !p_SSL_read || !p_SSL_write || !p_SSL_get_error || !p_SSL_shutdown ||
-        !p_SSL_free || !p_SHA256) {
+        !p_SSL_free || !p_SHA256 || !p_RAND_bytes || !p_EVP_Digest || !p_EVP_md5) {
         fprintf(stderr, "[anytls-tiny] Error: Failed to resolve required OpenSSL symbols: %s\n", dlerror());
         return -1;
     }
@@ -190,6 +199,7 @@ typedef struct {
     uint8_t rx_kick;        /* frames may be waiting without a POLLIN */
     uint8_t rx_want_write;  /* SSL_read / SSL_connect asked for POLLOUT */
     uint8_t tx_want_write;
+    uint8_t tx_hold;        /* cmdSettings waits for the first SYN, as in reference client */
     int peer_version;
     uint32_t seq;           /* creation order; the newest idle session is reused first */
     uint32_t next_sid;
@@ -202,6 +212,9 @@ typedef struct {
     int tx_inflight;        /* length of an SSL_write that must be retried */
     int server_idx;
     time_t created, ready_at, idle_since, last_rx, last_hb;
+    int pad_pkt;            /* next packet number of this session (0 is the auth) */
+    int pad_rec[PAD_MAX_REC];/* TLS record sizes left in the packet being written */
+    int pad_i, pad_n;
 } session_t;
 
 /* Stream tracking */
@@ -322,6 +335,106 @@ static int  g_min_idle = 1;
 /* SOCKS5-style address of the DNS resolver reached through the tunnel */
 static uint8_t g_dns_target[7] = { 0x01, 8, 8, 8, 8, 0, 53 };
 
+/* AnyTLS padding scheme; the server can replace it with cmdUpdatePaddingScheme */
+static const char g_default_scheme[] =
+    "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n"
+    "3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
+static char g_pad_scheme[2048];
+static char g_pad_md5[33];
+static int  g_pad_stop = 0;
+
+static int queue_frame(session_t *s, uint8_t cmd, uint32_t stream_id, const uint8_t *data, uint16_t len);
+
+/* Value of "key=" in the scheme's key=value lines, or NULL */
+static const char *scheme_get(const char *s, const char *key) {
+    size_t kl = strlen(key);
+    while (s) {
+        if (!strncmp(s, key, kl) && s[kl] == '=') return s + kl + 1;
+        s = strchr(s, '\n');
+        if (s) s++;
+    }
+    return NULL;
+}
+
+static int pad_set_scheme(const char *s, int len) {
+    char tmp[sizeof(g_pad_scheme)];
+    uint8_t md[16];
+    unsigned int mdlen;
+    if (len <= 0 || len >= (int)sizeof(tmp)) return -1;
+    memcpy(tmp, s, len);
+    tmp[len] = '\0';
+    const char *stop = scheme_get(tmp, "stop");
+    if (!stop || *stop < '0' || *stop > '9' || !p_EVP_Digest(tmp, len, md, &mdlen, p_EVP_md5(), NULL))
+        return -1;
+    memcpy(g_pad_scheme, tmp, len + 1);
+    g_pad_stop = atoi(stop);
+    for (int i = 0; i < 16; i++) sprintf(g_pad_md5 + 2 * i, "%02x", md[i]);
+    return 0;
+}
+
+/* Record sizes the scheme gives packet pkt, sampled from "a-b" ranges; -1 is a check mark */
+static int pad_sizes(int pkt, int *out) {
+    char key[12];
+    snprintf(key, sizeof(key), "%d", pkt);
+    const char *s = scheme_get(g_pad_scheme, key);
+    int n = 0;
+    while (s && n < PAD_MAX_REC - 1) {
+        char *e;
+        long lo = strtol(s, &e, 10), hi;
+        if (*s == 'c') {
+            out[n++] = -1;
+        } else if (e != s && *e == '-') {
+            hi = strtol(e + 1, &e, 10);
+            if (lo > hi) { long t = lo; lo = hi; hi = t; }
+            if (lo > 0) {
+                uint32_t r = 0;
+                p_RAND_bytes((unsigned char *)&r, sizeof(r));
+                if (hi > lo) lo += r % (hi - lo);
+                out[n++] = lo > PAD_MAX_SIZE ? PAD_MAX_SIZE : lo;
+            }
+        }
+        s = strpbrk(s, ",\n");
+        if (!s || *s++ == '\n') break;
+    }
+    return n;
+}
+
+/*
+ * Plan the next packet: everything queued now goes out as TLS records of the
+ * sizes the scheme asks for, with cmdWaste frames appended to fill them.
+ * Mirrors writeConn() in anytls-go's session.go.
+ */
+static void pad_plan(session_t *s) {
+    int sz[PAD_MAX_REC];
+    int n = pad_sizes(s->pad_pkt++, sz);
+    int remain = s->tx_len - s->tx_off;
+    s->pad_i = s->pad_n = 0;
+    for (int k = 0; k < n; k++) {
+        int l = sz[k], rec = remain;
+        if (l < 0) {
+            if (!remain) break;
+            continue;
+        }
+        if (remain > l) {
+            rec = l;
+        } else {
+            int pad = remain ? l - remain - FRAME_HDR : l;
+            if (pad > 0) {
+                if (s->tx_len + FRAME_HDR + pad > TX_BUF_SIZE) break;
+                uint8_t *p = s->tx_buf + s->tx_len;
+                memset(p, 0, FRAME_HDR + pad); /* cmdWaste, stream 0, zero data */
+                p[5] = (pad >> 8) & 0xFF;
+                p[6] = pad & 0xFF;
+                s->tx_len += FRAME_HDR + pad;
+                rec += FRAME_HDR + pad;
+            }
+        }
+        remain -= rec < remain ? rec : remain;
+        s->pad_rec[s->pad_n++] = rec;
+    }
+    if (remain) s->pad_rec[s->pad_n++] = remain;
+}
+
 static void set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags != -1) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -342,9 +455,19 @@ static int tx_pending(const session_t *s) {
 
 /* Write as much of the session's TX buffer as the socket accepts without blocking. */
 static void flush_tx(session_t *s) {
-    while (s->state == SESS_READY && !s->broken && s->tx_off < s->tx_len) {
-        /* A retried SSL_write must repeat the exact same buffer and length */
-        int len = s->tx_inflight ? s->tx_inflight : s->tx_len - s->tx_off;
+    while (s->state == SESS_READY && !s->broken && !s->tx_hold && s->tx_off < s->tx_len) {
+        int len;
+        if (s->pad_pkt == 0) {
+            /* Packet 0 is only the Auth header (34 + pad0 bytes) */
+            int pad0 = (s->tx_buf[32] << 8) | s->tx_buf[33];
+            int alen = 34 + pad0;
+            len = s->tx_inflight ? s->tx_inflight : alen - s->tx_off;
+        } else {
+            if (!s->pad_n && !s->tx_inflight && s->pad_pkt < g_pad_stop) pad_plan(s);
+            /* A retried SSL_write must repeat the exact same buffer and length */
+            len = s->tx_inflight ? s->tx_inflight : s->pad_n ? s->pad_rec[s->pad_i] : s->tx_len - s->tx_off;
+        }
+
         clear_ssl_errors();
         int n = p_SSL_write(s->ssl, s->tx_buf + s->tx_off, len);
         if (n <= 0) {
@@ -360,10 +483,29 @@ static void flush_tx(session_t *s) {
         }
         s->tx_inflight = 0;
         s->tx_off += n;
+
+        if (s->pad_pkt == 0) {
+            int pad0 = (s->tx_buf[32] << 8) | s->tx_buf[33];
+            int alen = 34 + pad0;
+            if (s->tx_off == alen) {
+                /* Packet 0 sent! Shift remainder (cmdSettings + any queued frames) to front */
+                memmove(s->tx_buf, s->tx_buf + alen, s->tx_len - alen);
+                s->tx_len -= alen;
+                s->tx_off = 0;
+                s->pad_pkt = 1;
+                s->pad_i = s->pad_n = 0;
+                if (s->nstreams + s->ndns == 0) {
+                    s->tx_hold = 1;
+                    break;
+                }
+            }
+        } else if (s->pad_n && (s->pad_rec[s->pad_i] -= n) == 0 && ++s->pad_i == s->pad_n) {
+            s->pad_n = 0;
+        }
     }
+    s->tx_want_write = 0;
     if (s->tx_off == s->tx_len) {
         s->tx_off = s->tx_len = 0;
-        s->tx_want_write = 0;
     }
 }
 
@@ -468,7 +610,7 @@ static void session_handshake(session_t *s) {
         g_consecutive_fails = 0;
         g_backoff = 0;
         server_entry_t *srv = &g_servers[s->server_idx];
-        printf("[anytls-tiny] Session %u: connected to [%d/%d] %s:%d! TLS handshake done, auth + settings sent\n",
+        printf("[anytls-tiny] Session %u: connected to [%d/%d] %s:%d! TLS handshake done, auth sent\n",
                s->seq, s->server_idx + 1, g_num_servers, srv->host, srv->port);
         fflush(stdout);
         flush_tx(s);
@@ -619,22 +761,29 @@ static session_t *session_create(time_t now) {
            s->seq, g_current_server_idx + 1, g_num_servers, srv->host, srv->port, srv->sni);
     fflush(stdout);
 
-    /* 1. Auth header: SHA256(password) + uint16(30) + 30 zero bytes */
-    if (tx_reserve(s, 64) < 0) {
+    /* 1. Packet 0: SHA256(password) + uint16 padding0 length + padding0 zero bytes, sent on its own */
+    int sz[PAD_MAX_REC];
+    int pad0 = pad_sizes(0, sz) > 0 && sz[0] > 0 ? sz[0] : 0;
+    int alen = 34 + pad0;
+    if (tx_reserve(s, alen) < 0) {
         s->broken = 1;
         session_free(s, "out of memory");
         return NULL;
     }
-    uint8_t *auth = s->tx_buf;
-    p_SHA256((const unsigned char *)g_password, strlen(g_password), auth);
-    auth[32] = 0;
-    auth[33] = 30;
-    memset(auth + 34, 0, 30);
-    s->tx_len = 64;
+    p_SHA256((const unsigned char *)g_password, strlen(g_password), s->tx_buf);
+    s->tx_buf[32] = (pad0 >> 8) & 0xFF;
+    s->tx_buf[33] = pad0 & 0xFF;
+    memset(s->tx_buf + 34, 0, pad0);
+    s->tx_len = alen;
+    s->tx_off = 0;
+    s->tx_hold = 0;
+    s->pad_pkt = 0;
+    s->pad_i = s->pad_n = 0;
 
-    /* 2. cmdSettings; both go out after the handshake in one TLS record with the first SYN */
-    static const char settings_data[] = "v=2\nclient=anytls/0.0.1\npadding-md5=00000000000000000000000000000000\n";
-    queue_frame(s, CMD_SETTINGS, 0, (const uint8_t *)settings_data, sizeof(settings_data) - 1);
+    /* 2. cmdSettings is queued right after auth; both will share packet 1 with the first SYN */
+    char settings[80];
+    int slen = snprintf(settings, sizeof(settings), "v=2\nclient=anytls/0.0.1\npadding-md5=%s\n", g_pad_md5);
+    queue_frame(s, CMD_SETTINGS, 0, (const uint8_t *)settings, slen);
 
     if (connect(fd, (struct sockaddr *)&srv->addr, sizeof(srv->addr)) == 0) {
         session_start_tls(s);
@@ -721,7 +870,12 @@ static int open_remote_stream(stream_t *st, const uint8_t *addr, int addr_len) {
     st->stream_id = s->next_sid;
     s->next_sid += 2; /* Client stream IDs are odd */
     if (queue_frame(s, CMD_SYN, st->stream_id, NULL, 0) < 0) return -1;
-    return queue_frame(s, CMD_PSH, st->stream_id, addr, addr_len);
+    if (queue_frame(s, CMD_PSH, st->stream_id, addr, addr_len) < 0) return -1;
+    if (s->tx_hold) {
+        s->tx_hold = 0;
+        flush_tx(s);
+    }
+    return 0;
 }
 
 static void close_stream(stream_t *st) {
@@ -1016,6 +1170,10 @@ static void handle_dns_udp_query(void) {
         queue_frame(s, CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
         release_dns_req(d, 0);
     }
+    if (s->tx_hold) {
+        s->tx_hold = 0;
+        flush_tx(s);
+    }
 }
 
 static void dns_reply(dns_req_t *d, const uint8_t *msg, int len) {
@@ -1085,12 +1243,18 @@ static void handle_frame(session_t *s, uint8_t cmd, uint32_t sid, const uint8_t 
             }
         }
         break;
+    case CMD_UPDATE_PADDING:
+        if (pad_set_scheme((const char *)data, len) == 0) {
+            printf("[anytls-tiny] Padding scheme updated by server (md5 %s)\n", g_pad_md5);
+            fflush(stdout);
+        }
+        break;
     case CMD_ALERT:
         fprintf(stderr, "[anytls-tiny] Alert from server: %.*s\n", len > 200 ? 200 : len, (const char *)data);
         s->broken = 1;
         break;
     default:
-        /* cmdWaste, cmdUpdatePaddingScheme, cmdHeartResponse: nothing to do */
+        /* cmdWaste, cmdHeartResponse: nothing to do */
         break;
     }
 }
@@ -1193,7 +1357,7 @@ static void periodic_tick(time_t now) {
 
         if (rx_paused(s)) s->last_rx = now; /* unread data is waiting in the kernel, the session is alive */
 
-        if (s->peer_version >= 2) {
+        if (s->peer_version >= 2 && !s->tx_hold) {
             if (now - s->last_rx >= HEARTBEAT_IDLE && now - s->last_hb >= HEARTBEAT_IDLE) {
                 queue_frame(s, CMD_HEART_REQ, 0, NULL, 0);
                 s->last_hb = now;
@@ -1343,6 +1507,7 @@ int main(int argc, char **argv) {
     if (init_openssl() < 0) {
         return 1;
     }
+    pad_set_scheme(g_default_scheme, sizeof(g_default_scheme) - 1);
 
     g_ssl_ctx = p_SSL_CTX_new(p_TLS_client_method());
     if (!g_ssl_ctx) {

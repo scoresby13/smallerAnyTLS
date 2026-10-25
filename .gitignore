@@ -1,5 +1,6 @@
 # Binaries and build artifacts
 anytls-tiny
+anytls-tiny-*
 *.o
 *.a
 *.so
