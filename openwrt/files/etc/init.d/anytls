@@ -15,10 +15,13 @@ start_service() {
     config_get_bool enabled main enabled 0
     [ "$enabled" -eq 1 ] || return 0
 
-    config_get server main server ""
-    config_get port main port "443"
+    local servers=""
+    append_server() {
+        servers="$servers -s $1"
+    }
+    config_list_foreach main server append_server
+
     config_get password main password ""
-    config_get sni main sni ""
     config_get socks_port main socks_port "1080"
     config_get redir_port main redir_port "1100"
     config_get dns_port main dns_port "5353"
@@ -28,19 +31,23 @@ start_service() {
     config_get idle_timeout main idle_timeout "60"
     config_get min_idle main min_idle "1"
 
-    [ -n "$server" ] && [ -n "$password" ] || {
+    if [ -z "$servers" ]; then
+        config_get server main server ""
+        config_get port main port "443"
+        config_get sni main sni ""
+        [ -n "$sni" ] || sni="$server"
+        [ -n "$server" ] && servers="-s $server:$port:$sni"
+    fi
+
+    [ -n "$servers" ] && [ -n "$password" ] || {
         echo "[anytls] Error: server and password must be configured in /etc/config/anytls" >&2
         return 1
     }
 
-    [ -n "$sni" ] || sni="$server"
-
     procd_open_instance
     procd_set_param command "$PROG" \
-        -s "$server" \
-        -p "$port" \
+        $servers \
         -k "$password" \
-        -h "$sni" \
         -l "$socks_port" \
         -r "$redir_port" \
         -u "$dns_port" \

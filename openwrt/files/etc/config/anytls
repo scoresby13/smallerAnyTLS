@@ -1,9 +1,15 @@
 config anytls 'main'
 	option enabled '0'
+	# Single server setup:
 	option server 'your-server.example.com'
 	option port '443'
-	option password 'your-uuid-or-password'
 	option sni 'your-sni.example.com'
+
+	# Or multiple servers for automatic failover rotation (host:port:sni):
+	# list server 'server1.example.com:443:sni1.example.com'
+	# list server 'server2.example.com:443:sni2.example.com'
+
+	option password 'your-uuid-or-password'
 	option socks_port '1080'
 	option redir_port '1100'
 	option dns_port '5353'

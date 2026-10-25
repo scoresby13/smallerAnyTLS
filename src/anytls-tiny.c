@@ -200,6 +200,7 @@ typedef struct {
     uint8_t *tx_buf;
     int tx_off, tx_len;
     int tx_inflight;        /* length of an SSL_write that must be retried */
+    int server_idx;
     time_t created, ready_at, idle_since, last_rx, last_hb;
 } session_t;
 
@@ -237,16 +238,79 @@ static SSL_CTX *g_ssl_ctx = NULL;
 static int      g_backoff = 0;
 static time_t   g_next_connect = 0;
 static time_t   g_last_fail = 0;
-static struct sockaddr_in g_srv_addr;
-static time_t   g_srv_resolved = 0;
+#define MAX_SERVERS 32
+
+typedef struct {
+    char host[128];
+    int port;
+    char sni[128];
+    struct sockaddr_in addr;
+    time_t resolved_at;
+} server_entry_t;
+
+static server_entry_t g_servers[MAX_SERVERS];
+static int g_num_servers = 0;
+static int g_current_server_idx = 0;
+static int g_consecutive_fails = 0;
+
+static void add_server(const char *host, int port, const char *sni) {
+    if (g_num_servers >= MAX_SERVERS || !host || !host[0]) return;
+    server_entry_t *s = &g_servers[g_num_servers++];
+    memset(s, 0, sizeof(*s));
+    strncpy(s->host, host, sizeof(s->host) - 1);
+    s->port = (port > 0) ? port : 443;
+    if (sni && sni[0]) {
+        strncpy(s->sni, sni, sizeof(s->sni) - 1);
+    } else {
+        strncpy(s->sni, host, sizeof(s->sni) - 1);
+    }
+}
+
+static void parse_and_add_server(const char *arg, int default_port, const char *default_sni) {
+    char buf[256];
+    strncpy(buf, arg, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *host = buf;
+    int port = default_port;
+    char sni[128] = "";
+
+    char *first_colon = strchr(host, ':');
+    if (first_colon) {
+        *first_colon = '\0';
+        char *rest = first_colon + 1;
+        char *second_colon = strchr(rest, ':');
+        if (second_colon) {
+            *second_colon = '\0';
+            strncpy(sni, second_colon + 1, sizeof(sni) - 1);
+        }
+        port = atoi(rest);
+    }
+    if (sni[0] == '\0') {
+        if (default_sni && default_sni[0]) {
+            strncpy(sni, default_sni, sizeof(sni) - 1);
+        } else {
+            strncpy(sni, host, sizeof(sni) - 1);
+        }
+    }
+    add_server(host, port, sni);
+}
+
+static void failover_next_server(const char *reason) {
+    if (g_num_servers <= 1) return;
+    g_current_server_idx = (g_current_server_idx + 1) % g_num_servers;
+    printf("[anytls-tiny] Failover (%s): switched to [%d/%d] %s:%d (SNI: %s)\n",
+           reason, g_current_server_idx + 1, g_num_servers,
+           g_servers[g_current_server_idx].host,
+           g_servers[g_current_server_idx].port,
+           g_servers[g_current_server_idx].sni);
+    fflush(stdout);
+}
 
 static uint8_t g_client_rx_buf[CLIENT_READ_SIZE];
 static long    g_wbuf_total = 0;
 
-static char g_server_host[256] = "";
-static int  g_server_port = 443;
 static char g_password[256] = "";
-static char g_sni[256] = "";
 static char g_bind_addr[64] = "0.0.0.0";
 static int  g_socks_port = 1080;
 static int  g_redir_port = 1100;
@@ -363,30 +427,34 @@ static void session_unref(session_t *s, int dns) {
 }
 
 static void bump_backoff(time_t now) {
-    /* Attempts that fail together (e.g. the server is down) count once */
-    if (now < g_next_connect) return;
+    g_consecutive_fails++;
     g_last_fail = now;
-    g_backoff = g_backoff ? (g_backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : g_backoff * 2) : 1;
-    g_next_connect = now + g_backoff;
+    /* Try all configured servers before delaying connection attempts */
+    if (g_consecutive_fails >= g_num_servers) {
+        g_backoff = g_backoff ? (g_backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : g_backoff * 2) : 1;
+        g_next_connect = now + g_backoff;
+    } else {
+        g_next_connect = now;
+    }
 }
 
-static int resolve_server(time_t now) {
-    if (g_srv_resolved && now - g_srv_resolved < RESOLVE_TTL) return 0;
+static int resolve_server(server_entry_t *srv, time_t now) {
+    if (srv->resolved_at && now - srv->resolved_at < RESOLVE_TTL) return 0;
 
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", g_server_port);
+    snprintf(port_str, sizeof(port_str), "%d", srv->port);
 
-    if (getaddrinfo(g_server_host, port_str, &hints, &res) != 0 || !res) {
-        fprintf(stderr, "[anytls-tiny] Failed to resolve %s\n", g_server_host);
+    if (getaddrinfo(srv->host, port_str, &hints, &res) != 0 || !res) {
+        fprintf(stderr, "[anytls-tiny] Failed to resolve %s\n", srv->host);
         return -1;
     }
-    memcpy(&g_srv_addr, res->ai_addr, sizeof(g_srv_addr));
+    memcpy(&srv->addr, res->ai_addr, sizeof(srv->addr));
     freeaddrinfo(res);
-    g_srv_resolved = now;
+    srv->resolved_at = now;
     return 0;
 }
 
@@ -397,7 +465,11 @@ static void session_handshake(session_t *s) {
         s->state = SESS_READY;
         s->rx_want_write = 0;
         s->ready_at = s->last_rx = s->last_hb = time(NULL);
-        printf("[anytls-tiny] Session %u: TLS handshake done, auth + settings sent\n", s->seq);
+        g_consecutive_fails = 0;
+        g_backoff = 0;
+        server_entry_t *srv = &g_servers[s->server_idx];
+        printf("[anytls-tiny] Session %u: connected to [%d/%d] %s:%d! TLS handshake done, auth + settings sent\n",
+               s->seq, s->server_idx + 1, g_num_servers, srv->host, srv->port);
         fflush(stdout);
         flush_tx(s);
         return;
@@ -409,6 +481,9 @@ static void session_handshake(session_t *s) {
     }
     fprintf(stderr, "[anytls-tiny] Session %u: SSL_connect failed (err=%d)\n", s->seq, err);
     s->broken = 1;
+    if (s->server_idx == g_current_server_idx) {
+        failover_next_server("handshake failed");
+    }
 }
 
 static void session_start_tls(session_t *s) {
@@ -418,7 +493,8 @@ static void session_start_tls(session_t *s) {
         return;
     }
     p_SSL_set_fd(s->ssl, s->fd);
-    p_SSL_ctrl(s->ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, g_sni);
+    server_entry_t *srv = &g_servers[s->server_idx];
+    p_SSL_ctrl(s->ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, srv->sni);
     /* RELEASE_BUFFERS lets idle sessions give OpenSSL's record buffers back */
     p_SSL_ctrl(s->ssl, SSL_CTRL_MODE, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
                SSL_MODE_RELEASE_BUFFERS, NULL);
@@ -438,6 +514,9 @@ static void session_connected(session_t *s) {
     if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err) {
         fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(err ? err : errno));
         s->broken = 1;
+        if (s->server_idx == g_current_server_idx) {
+            failover_next_server("connect error");
+        }
         return;
     }
     session_start_tls(s);
@@ -448,7 +527,9 @@ static void session_free(session_t *s, const char *why) {
     if (s->broken) {
         /* A session that fails to come up, or dies right after (e.g. wrong password), backs off */
         if (s->state != SESS_READY || now - s->ready_at < 10) bump_backoff(now);
-        if (s->state != SESS_READY) g_srv_resolved = 0; /* the server's address may have changed */
+        if (s->state != SESS_READY && s->server_idx >= 0 && s->server_idx < g_num_servers) {
+            g_servers[s->server_idx].resolved_at = 0; /* the server's address may have changed */
+        }
     }
     printf("[anytls-tiny] Session %u closed (%s, %d stream(s))\n", s->seq, why, s->nstreams);
     fflush(stdout);
@@ -500,14 +581,17 @@ static int can_create_session(time_t now) {
 
 /* Start a non-blocking connect; the handshake is driven from the event loop */
 static session_t *session_create(time_t now) {
+    if (g_num_servers == 0) return NULL;
     session_t *s = NULL;
     for (int i = 0; i < MAX_SESSIONS && !s; i++) {
         if (g_sessions[i].state == SESS_FREE) s = &g_sessions[i];
     }
     if (!s) return NULL;
 
-    if (resolve_server(now) < 0) {
+    server_entry_t *srv = &g_servers[g_current_server_idx];
+    if (resolve_server(srv, now) < 0) {
         bump_backoff(now);
+        failover_next_server("resolve failed");
         return NULL;
     }
 
@@ -527,10 +611,12 @@ static session_t *session_create(time_t now) {
     s->fd = fd;
     s->state = SESS_CONNECTING;
     s->seq = ++g_session_seq;
+    s->server_idx = g_current_server_idx;
     s->next_sid = 1;
     s->created = s->idle_since = now;
 
-    printf("[anytls-tiny] Session %u: connecting to %s:%d (SNI: %s)\n", s->seq, g_server_host, g_server_port, g_sni);
+    printf("[anytls-tiny] Session %u: connecting to [%d/%d] %s:%d (SNI: %s)\n",
+           s->seq, g_current_server_idx + 1, g_num_servers, srv->host, srv->port, srv->sni);
     fflush(stdout);
 
     /* 1. Auth header: SHA256(password) + uint16(30) + 30 zero bytes */
@@ -550,11 +636,13 @@ static session_t *session_create(time_t now) {
     static const char settings_data[] = "v=2\nclient=anytls/0.0.1\npadding-md5=00000000000000000000000000000000\n";
     queue_frame(s, CMD_SETTINGS, 0, (const uint8_t *)settings_data, sizeof(settings_data) - 1);
 
-    if (connect(fd, (struct sockaddr *)&g_srv_addr, sizeof(g_srv_addr)) == 0) {
+    if (connect(fd, (struct sockaddr *)&srv->addr, sizeof(srv->addr)) == 0) {
         session_start_tls(s);
     } else if (errno != EINPROGRESS) {
         fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(errno));
         s->broken = 1;
+        bump_backoff(now);
+        failover_next_server("connect immediate error");
     }
     if (s->broken) {
         session_free(s, "connect failed");
@@ -1090,12 +1178,18 @@ static void periodic_tick(time_t now) {
             if (now - s->created >= CONNECT_TIMEOUT) {
                 fprintf(stderr, "[anytls-tiny] Session %u: connect/handshake timed out\n", s->seq);
                 s->broken = 1;
+                if (s->server_idx == g_current_server_idx) {
+                    failover_next_server("connect/handshake timeout");
+                }
             }
             continue;
         }
 
         /* Only a session that came up after the last failure and stays up resets the backoff */
-        if (g_backoff && s->ready_at >= g_last_fail && now - s->ready_at >= 10) g_backoff = 0;
+        if (g_backoff && s->ready_at >= g_last_fail && now - s->ready_at >= 10) {
+            g_backoff = 0;
+            g_consecutive_fails = 0;
+        }
 
         if (rx_paused(s)) s->last_rx = now; /* unread data is waiting in the kernel, the session is alive */
 
@@ -1108,6 +1202,9 @@ static void periodic_tick(time_t now) {
                 printf("[anytls-tiny] Session %u: no data from server for %ds\n", s->seq, DEAD_TIMEOUT);
                 fflush(stdout);
                 s->broken = 1;
+                if (s->server_idx == g_current_server_idx) {
+                    failover_next_server("dead session");
+                }
                 continue;
             }
         }
@@ -1170,13 +1267,13 @@ static int parse_dns_target(const char *s) {
 }
 
 static void print_usage(const char *prog) {
-    fprintf(stderr, "smallerAnyTLS - Ultra-lightweight AnyTLS v2 Client\n\n");
-    fprintf(stderr, "Usage: %s -s <server> -p <port> -k <password> -h <sni> [options]\n\n", prog);
+    fprintf(stderr, "smallerAnyTLS - Ultra-lightweight AnyTLS v2 Client with Multi-Server Pool\n\n");
+    fprintf(stderr, "Usage: %s -s <host[:port[:sni]]> [-s ...] -k <password> [options]\n\n", prog);
     fprintf(stderr, "Required options:\n");
-    fprintf(stderr, "  -s <host/ip>    Upstream AnyTLS server address\n");
-    fprintf(stderr, "  -p <port>       Upstream AnyTLS server port (e.g. 443)\n");
+    fprintf(stderr, "  -s <server>     Upstream AnyTLS server address (host[:port[:sni]], repeatable)\n");
     fprintf(stderr, "  -k <password>   AnyTLS authentication password or UUID\n");
-    fprintf(stderr, "  -h <sni>        TLS Server Name Indication (SNI, e.g. www.apple.com)\n\n");
+    fprintf(stderr, "  -p <port>       Default upstream port (default: 443)\n");
+    fprintf(stderr, "  -h <sni>        Default TLS SNI hostname\n\n");
     fprintf(stderr, "Optional:\n");
     fprintf(stderr, "  -l <port>       Local SOCKS5 proxy port (default: 1080, 0 = off)\n");
     fprintf(stderr, "  -r <port>       Transparent redirect port (SO_ORIGINAL_DST, default: 1100, 0 = off)\n");
@@ -1191,12 +1288,22 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     int opt, daemonize = 0;
+    char cli_host[128] = "";
+    int cli_port = 443;
+    char cli_sni[128] = "";
+
     while ((opt = getopt(argc, argv, "s:p:k:h:l:r:u:n:b:m:i:w:d")) != -1) {
         switch (opt) {
-            case 's': strncpy(g_server_host, optarg, sizeof(g_server_host)-1); break;
-            case 'p': g_server_port = atoi(optarg); break;
+            case 's':
+                if (strchr(optarg, ':')) {
+                    parse_and_add_server(optarg, cli_port, cli_sni);
+                } else {
+                    strncpy(cli_host, optarg, sizeof(cli_host)-1);
+                }
+                break;
+            case 'p': cli_port = atoi(optarg); break;
             case 'k': strncpy(g_password, optarg, sizeof(g_password)-1); break;
-            case 'h': strncpy(g_sni, optarg, sizeof(g_sni)-1); break;
+            case 'h': strncpy(cli_sni, optarg, sizeof(cli_sni)-1); break;
             case 'l': g_socks_port = atoi(optarg); break;
             case 'r': g_redir_port = atoi(optarg); break;
             case 'u': g_dns_port = atoi(optarg); break;
@@ -1217,18 +1324,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (g_server_host[0] == '\0' || g_password[0] == '\0') {
-        fprintf(stderr, "[anytls-tiny] Error: Server (-s) and password (-k) are required.\n\n");
+    if (g_num_servers == 0 && cli_host[0] != '\0') {
+        add_server(cli_host, cli_port, cli_sni[0] ? cli_sni : cli_host);
+    }
+
+    if (g_num_servers == 0 || g_password[0] == '\0') {
+        fprintf(stderr, "[anytls-tiny] Error: At least one server (-s) and password (-k) are required.\n\n");
         print_usage(argv[0]);
         return 1;
     }
     if (g_max_sessions < 1 || g_max_sessions > MAX_SESSIONS || g_idle_timeout < 1 || g_min_idle < 0) {
         fprintf(stderr, "[anytls-tiny] Error: -m must be 1-%d, -i at least 1, -w at least 0.\n", MAX_SESSIONS);
         return 1;
-    }
-
-    if (g_sni[0] == '\0') {
-        strncpy(g_sni, g_server_host, sizeof(g_sni) - 1);
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -1261,8 +1368,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[anytls-tiny] Started! SOCKS5:%d, Redir:%d, DNS-UDP:%d, max sessions:%d\n",
-           g_socks_port, g_redir_port, g_dns_port, g_max_sessions);
+    printf("[anytls-tiny] Started! Servers: %d, SOCKS5:%d, Redir:%d, DNS-UDP:%d, max sessions:%d\n",
+           g_num_servers, g_socks_port, g_redir_port, g_dns_port, g_max_sessions);
+    for (int i = 0; i < g_num_servers; i++) {
+        printf("  [%d] %s:%d (SNI: %s)\n", i + 1, g_servers[i].host, g_servers[i].port, g_servers[i].sni);
+    }
     fflush(stdout);
 
     for (int i = 0; i < MAX_SESSIONS; i++) g_sessions[i].fd = -1;
