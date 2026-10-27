@@ -758,6 +758,7 @@ static session_t *session_create(time_t now) {
     s->seq = ++g_session_seq;
     s->server_idx = g_current_server_idx;
     s->next_sid = 1;
+    s->peer_version = 2; /* Default to v2 to enable active heartbeats */
     s->created = s->idle_since = now;
 
     printf("[anytls-tiny] Session %u: connecting to [%d/%d] %s:%d (SNI: %s)\n",
@@ -1370,6 +1371,7 @@ static void periodic_tick(time_t now) {
             if (now - s->last_rx >= HEARTBEAT_IDLE && now - s->last_hb >= HEARTBEAT_IDLE) {
                 queue_frame(s, CMD_HEART_REQ, 0, NULL, 0);
                 s->last_hb = now;
+                flush_tx(s);
             }
             if (now - s->last_rx >= DEAD_TIMEOUT) {
                 printf("[anytls-tiny] Session %u: no data from server for %ds\n", s->seq, DEAD_TIMEOUT);
