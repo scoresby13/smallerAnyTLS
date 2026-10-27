@@ -2,7 +2,7 @@
  * smallerAnyTLS - Ultra-lightweight AnyTLS v2 Client
  *
  * Designed for embedded Linux / OpenWrt routers with severe storage constraints.
- * Binary footprint: ~25 KB (stripped).
+ * Binary footprint: ~35 KB (stripped).
  * Dependencies: libc, libdl (dynamically loads OpenSSL from firmware ROM).
  *
  * Supports:
@@ -64,7 +64,6 @@
 /* A stream that blocks its session this long without draining is dropped */
 #define STALL_TIMEOUT 10
 #define IDLE_WRITE_TIMEOUT 60
-#define STREAM_IDLE_TIMEOUT 180
 #define STREAM_HANDSHAKE_TIMEOUT 30
 #define HEARTBEAT_IDLE 15
 #define DEAD_TIMEOUT 45
@@ -571,16 +570,23 @@ static void session_unref(session_t *s, int dns) {
     if (s->nstreams + s->ndns == 0) s->idle_since = time(NULL);
 }
 
-static void bump_backoff(time_t now) {
-    g_consecutive_fails++;
+/*
+ * A connection attempt to server srv_idx failed, or its session died right
+ * after coming up (e.g. wrong password). Only a failure on the server in use
+ * counts, and none while already backing off, so sessions that fail together
+ * count once. Every server is tried before connecting backs off.
+ */
+static void note_failure(int srv_idx, time_t now, const char *reason) {
+    if (srv_idx != g_current_server_idx || now < g_next_connect) return;
     g_last_fail = now;
-    /* Try all configured servers before delaying connection attempts */
-    if (g_consecutive_fails >= g_num_servers) {
+    if (++g_consecutive_fails >= g_num_servers) {
+        g_consecutive_fails = 0;
         g_backoff = g_backoff ? (g_backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : g_backoff * 2) : 1;
         g_next_connect = now + g_backoff;
     } else {
         g_next_connect = now;
     }
+    failover_next_server(reason);
 }
 
 static int resolve_server(server_entry_t *srv, time_t now) {
@@ -610,8 +616,6 @@ static void session_handshake(session_t *s) {
         s->state = SESS_READY;
         s->rx_want_write = 0;
         s->ready_at = s->last_rx = s->last_hb = time(NULL);
-        g_consecutive_fails = 0;
-        g_backoff = 0;
         server_entry_t *srv = &g_servers[s->server_idx];
         printf("[anytls-tiny] Session %u: connected to [%d/%d] %s:%d! TLS handshake done, auth sent\n",
                s->seq, s->server_idx + 1, g_num_servers, srv->host, srv->port);
@@ -626,9 +630,6 @@ static void session_handshake(session_t *s) {
     }
     fprintf(stderr, "[anytls-tiny] Session %u: SSL_connect failed (err=%d)\n", s->seq, err);
     s->broken = 1;
-    if (s->server_idx == g_current_server_idx) {
-        failover_next_server("handshake failed");
-    }
 }
 
 static void session_start_tls(session_t *s) {
@@ -659,9 +660,6 @@ static void session_connected(session_t *s) {
     if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err) {
         fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(err ? err : errno));
         s->broken = 1;
-        if (s->server_idx == g_current_server_idx) {
-            failover_next_server("connect error");
-        }
         return;
     }
     session_start_tls(s);
@@ -671,7 +669,8 @@ static void session_free(session_t *s, const char *why) {
     time_t now = time(NULL);
     if (s->broken) {
         /* A session that fails to come up, or dies right after (e.g. wrong password), backs off */
-        if (s->state != SESS_READY || now - s->ready_at < 10) bump_backoff(now);
+        if (s->state != SESS_READY || now - s->ready_at < 10)
+            note_failure(s->server_idx, now, s->state != SESS_READY ? "connect failed" : "dropped right after connecting");
         if (s->state != SESS_READY && s->server_idx >= 0 && s->server_idx < g_num_servers) {
             g_servers[s->server_idx].resolved_at = 0; /* the server's address may have changed */
         }
@@ -735,8 +734,7 @@ static session_t *session_create(time_t now) {
 
     server_entry_t *srv = &g_servers[g_current_server_idx];
     if (resolve_server(srv, now) < 0) {
-        bump_backoff(now);
-        failover_next_server("resolve failed");
+        note_failure(g_current_server_idx, now, "resolve failed");
         return NULL;
     }
 
@@ -794,8 +792,6 @@ static session_t *session_create(time_t now) {
     } else if (errno != EINPROGRESS) {
         fprintf(stderr, "[anytls-tiny] Session %u: connect error: %s\n", s->seq, strerror(errno));
         s->broken = 1;
-        bump_backoff(now);
-        failover_next_server("connect immediate error");
     }
     if (s->broken) {
         session_free(s, "connect failed");
@@ -1352,15 +1348,12 @@ static void periodic_tick(time_t now) {
             if (now - s->created >= CONNECT_TIMEOUT) {
                 fprintf(stderr, "[anytls-tiny] Session %u: connect/handshake timed out\n", s->seq);
                 s->broken = 1;
-                if (s->server_idx == g_current_server_idx) {
-                    failover_next_server("connect/handshake timeout");
-                }
             }
             continue;
         }
 
         /* Only a session that came up after the last failure and stays up resets the backoff */
-        if (g_backoff && s->ready_at >= g_last_fail && now - s->ready_at >= 10) {
+        if ((g_backoff || g_consecutive_fails) && s->ready_at >= g_last_fail && now - s->ready_at >= 10) {
             g_backoff = 0;
             g_consecutive_fails = 0;
         }
@@ -1402,7 +1395,8 @@ static void periodic_tick(time_t now) {
             release_dns_req(&g_dns_reqs[i], 1);
     }
 
-    /* Drop clients that stopped reading or idle connections */
+    /* Drop clients that stopped reading, or never finished the SOCKS handshake.
+     * Quiet connections (push notifications, SSH, chat) stay open, as they would direct. */
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *st = &g_streams[i];
         if (st->client_fd <= 0) continue;
@@ -1412,11 +1406,7 @@ static void periodic_tick(time_t now) {
                 now - st->wprogress >= IDLE_WRITE_TIMEOUT) {
                 close_stream(st);
             }
-        } else if (st->socks_state < 2) {
-            if (now - st->last_active >= STREAM_HANDSHAKE_TIMEOUT) {
-                close_stream(st);
-            }
-        } else if (now - st->last_active >= STREAM_IDLE_TIMEOUT) {
+        } else if (st->socks_state < 2 && now - st->last_active >= STREAM_HANDSHAKE_TIMEOUT) {
             close_stream(st);
         }
     }
@@ -1454,10 +1444,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s -s <host[:port[:sni]]> [-s ...] -k <password> [options]\n\n", prog);
     fprintf(stderr, "Required options:\n");
     fprintf(stderr, "  -s <server>     Upstream AnyTLS server address (host[:port[:sni]], repeatable)\n");
-    fprintf(stderr, "  -k <password>   AnyTLS authentication password or UUID\n");
-    fprintf(stderr, "  -p <port>       Default upstream port (default: 443)\n");
-    fprintf(stderr, "  -h <sni>        Default TLS SNI hostname\n\n");
+    fprintf(stderr, "  -k <password>   AnyTLS authentication password or UUID\n\n");
     fprintf(stderr, "Optional:\n");
+    fprintf(stderr, "  -p <port>       Port for servers given without one (default: 443)\n");
+    fprintf(stderr, "  -h <sni>        SNI for servers given without one (default: the server host)\n");
     fprintf(stderr, "  -l <port>       Local SOCKS5 proxy port (default: 1080, 0 = off)\n");
     fprintf(stderr, "  -r <port>       Transparent redirect port (SO_ORIGINAL_DST, default: 1100, 0 = off)\n");
     fprintf(stderr, "  -u <port>       DNS-over-TCP UDP listening port (default: 5353, 0 = off)\n");
@@ -1471,18 +1461,17 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     int opt, daemonize = 0;
-    char cli_host[128] = "";
+    const char *srv_args[MAX_SERVERS];
+    int nsrv = 0;
     int cli_port = 443;
     char cli_sni[128] = "";
 
     while ((opt = getopt(argc, argv, "s:p:k:h:l:r:u:n:b:m:i:w:d")) != -1) {
         switch (opt) {
             case 's':
-                if (strchr(optarg, ':')) {
-                    parse_and_add_server(optarg, cli_port, cli_sni);
-                } else {
-                    strncpy(cli_host, optarg, sizeof(cli_host)-1);
-                }
+                /* Parsed after all options so -p / -h defaults apply wherever they appear */
+                if (nsrv < MAX_SERVERS) srv_args[nsrv++] = optarg;
+                else fprintf(stderr, "[anytls-tiny] Warning: more than %d servers, ignoring %s\n", MAX_SERVERS, optarg);
                 break;
             case 'p': cli_port = atoi(optarg); break;
             case 'k': strncpy(g_password, optarg, sizeof(g_password)-1); break;
@@ -1507,8 +1496,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (g_num_servers == 0 && cli_host[0] != '\0') {
-        add_server(cli_host, cli_port, cli_sni[0] ? cli_sni : cli_host);
+    for (int i = 0; i < nsrv; i++) {
+        parse_and_add_server(srv_args[i], cli_port, cli_sni);
     }
 
     if (g_num_servers == 0 || g_password[0] == '\0') {

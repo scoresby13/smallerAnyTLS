@@ -1,0 +1,3 @@
+# Everything runs on Linux routers: shell scripts and Makefiles break with CRLF,
+# so always store and check out text files with LF line endings.
+* text=auto eol=lf
