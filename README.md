@@ -1,6 +1,6 @@
 # smallerAnyTLS (`anytls-tiny`)
 
-An ultra-compact (~25 KB) **AnyTLS v2** client written in pure C, specifically engineered for embedded Linux routers (such as OpenWrt) with strict flash storage and RAM constraints.
+An ultra-compact (~35 KB) **AnyTLS v2** client written in pure C, specifically engineered for embedded Linux routers (such as OpenWrt) with strict flash storage and RAM constraints.
 
 ---
 
@@ -11,7 +11,7 @@ Modern proxy clients (Sing-box, Xray, Clash, Mihomo, v2ray-core) are written in 
 Many legacy or compact consumer routers (e.g. Netgear, TP-Link, Xiaomi, GL.iNet) have only **4 MB, 8 MB, or 16 MB** total SPI flash memory, leaving merely **1 MB to 3 MB** of writable `/overlay` storage. On such devices, running standard Go/Rust proxy clients is completely impossible without external USB drives or extroot.
 
 **smallerAnyTLS** solves this problem from scratch:
-- **Binary Footprint**: **~25 KB** stripped (x86_64; about 10 KB once compressed in flash). Exact size varies by architecture.
+- **Binary Footprint**: **~35 KB** stripped (x86_64; about 14 KB once compressed in flash). Exact size varies by architecture.
 - **Low RAM**: a few MB resident, most of it the shared OpenSSL libraries.
 - **No Bundled TLS Library**: Loads the system OpenSSL (`libssl.so.3` or `libssl.so.1.1`) at runtime via `dlopen`, so the binary itself carries no crypto code.
 - **All-in-One Networking**: Built-in SOCKS5 proxy, transparent TCP proxy (`SO_ORIGINAL_DST`), and anti-poisoning DNS-over-TCP forwarder.
@@ -69,17 +69,17 @@ mips-openwrt-linux-musl-gcc -Os -pipe -mno-branch-likely -mips32r2 -mtune=24kc -
 ## 🔧 CLI Usage
 
 ```
-smallerAnyTLS - Ultra-lightweight AnyTLS v2 Client
+smallerAnyTLS - Ultra-lightweight AnyTLS v2 Client with Multi-Server Pool
 
-Usage: anytls-tiny -s <server> -p <port> -k <password> -h <sni> [options]
+Usage: anytls-tiny -s <host[:port[:sni]]> [-s ...] -k <password> [options]
 
-Required:
-  -s <host/ip>    Upstream AnyTLS server address or domain
-  -p <port>       Upstream AnyTLS server port (e.g. 443)
+Required options:
+  -s <server>     Upstream AnyTLS server address (host[:port[:sni]], repeatable)
   -k <password>   AnyTLS authentication password or UUID
-  -h <sni>        TLS Server Name Indication (SNI, e.g. www.apple.com)
 
 Optional:
+  -p <port>       Port for servers given without one (default: 443)
+  -h <sni>        SNI for servers given without one (default: the server host)
   -l <port>       Local SOCKS5 proxy port (default: 1080, 0 = off)
   -r <port>       Transparent redirect port (SO_ORIGINAL_DST, default: 1100, 0 = off)
   -u <port>       DNS-over-TCP UDP listening port (default: 5353, 0 = off)
@@ -91,10 +91,16 @@ Optional:
   -d              Run as background daemon
 ```
 
-**Example:**
+**Examples:**
 ```bash
+# One server
 ./anytls-tiny -s your-server.com -p 443 -k your-uuid -h www.microsoft.com -d
+
+# Several servers with automatic failover, each as host:port:sni
+./anytls-tiny -s us.example.com:443:www.microsoft.com -s sg.example.com:8443 -k your-uuid -d
 ```
+
+**Failover:** new connections go to the first server until connecting to it fails, a session drops right after connecting, or a session gets no reply for 45 s; then they move to the next one. When every server has failed in a row, it waits 1, 2, 4 … up to 30 s between rounds. It does not switch back to the first server on its own.
 
 ---
 
@@ -130,6 +136,9 @@ config anytls 'main'
 	option port '443'
 	option password 'your-password'
 	option sni 'www.apple.com'
+	# For failover, replace server/port/sni with one line per server:
+	# list server 'us.example.com:443:www.apple.com'
+	# list server 'sg.example.com:443:www.apple.com'
 	option socks_port '1080'
 	option redir_port '1100'
 	option dns_port '5353'
