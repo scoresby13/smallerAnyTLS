@@ -46,7 +46,7 @@
 #define CMD_SERVER_SETTINGS    10
 
 #define FRAME_HDR 7
-#define MAX_STREAMS 256
+#define MAX_STREAMS 512
 #define MAX_DNS_REQS 64
 /* Hard upper bound for -m; each live session costs one TLS connection */
 #define MAX_SESSIONS 32
@@ -64,6 +64,8 @@
 /* A stream that blocks its session this long without draining is dropped */
 #define STALL_TIMEOUT 10
 #define IDLE_WRITE_TIMEOUT 60
+#define STREAM_IDLE_TIMEOUT 180
+#define STREAM_HANDSHAKE_TIMEOUT 30
 #define HEARTBEAT_IDLE 15
 #define DEAD_TIMEOUT 45
 #define DNS_TIMEOUT 6
@@ -225,6 +227,7 @@ typedef struct {
     uint8_t is_redir;
     uint8_t socks_state;  /* 0: auth, 1: req, 2: connected */
     uint8_t remote_fin;   /* server closed the stream; close once wbuf drains */
+    time_t last_active;
     /* Downstream data the LAN client could not accept yet */
     uint8_t *wbuf;
     int wlen, woff, wcap;
@@ -849,6 +852,7 @@ static stream_t *alloc_stream(int client_fd, int is_redir) {
             g_streams[i].client_fd = client_fd;
             g_streams[i].is_redir = is_redir;
             g_streams[i].socks_state = is_redir ? 2 : 0;
+            g_streams[i].last_active = time(NULL);
             return &g_streams[i];
         }
     }
@@ -862,9 +866,11 @@ static void wbuf_account(stream_t *st, long delta) {
 
 /* Bind the stream to a session and send cmdSYN + target address; IDs are assigned in SYN order */
 static int open_remote_stream(stream_t *st, const uint8_t *addr, int addr_len) {
-    session_t *s = acquire_session(time(NULL));
+    time_t now = time(NULL);
+    session_t *s = acquire_session(now);
     if (!s) return -1;
     st->sess = s;
+    st->last_active = now;
     s->nstreams++;
     s->wbuf_total += st->wlen - st->woff;
     st->stream_id = s->next_sid;
@@ -895,6 +901,7 @@ static void close_stream(stream_t *st) {
 
 /* Deliver downstream data to a LAN client, buffering whatever it can't take yet */
 static int stream_write(stream_t *st, const uint8_t *data, int len) {
+    st->last_active = time(NULL);
     if (st->woff == st->wlen) {
         while (len > 0) {
             int n = send(st->client_fd, data, len, MSG_NOSIGNAL);
@@ -926,6 +933,7 @@ static int stream_write(stream_t *st, const uint8_t *data, int len) {
 }
 
 static void stream_flush(stream_t *st) {
+    st->last_active = time(NULL);
     while (st->woff < st->wlen) {
         int n = send(st->client_fd, st->wbuf + st->woff, st->wlen - st->woff, MSG_NOSIGNAL);
         if (n > 0) {
@@ -1110,6 +1118,7 @@ static void handle_client_data(stream_t *st) {
     for (int k = 0; k < 4 && tx_pending(st->sess) < TX_HIGH_WATER; k++) {
         int n = recv(st->client_fd, g_client_rx_buf, sizeof(g_client_rx_buf), 0);
         if (n > 0) {
+            st->last_active = time(NULL);
             if (queue_frame(st->sess, CMD_PSH, st->stream_id, g_client_rx_buf, n) < 0) {
                 close_stream(st);
                 return;
@@ -1391,13 +1400,21 @@ static void periodic_tick(time_t now) {
             release_dns_req(&g_dns_reqs[i], 1);
     }
 
-    /* Drop clients that stopped reading: they would otherwise stall their session */
+    /* Drop clients that stopped reading or idle connections */
     for (int i = 0; i < MAX_STREAMS; i++) {
         stream_t *st = &g_streams[i];
+        if (st->client_fd <= 0) continue;
         int pending = st->wlen - st->woff;
-        if (st->client_fd <= 0 || pending == 0) continue;
-        if ((pending > WBUF_STREAM_MAX && now - st->wprogress >= STALL_TIMEOUT) ||
-            now - st->wprogress >= IDLE_WRITE_TIMEOUT) {
+        if (pending > 0) {
+            if ((pending > WBUF_STREAM_MAX && now - st->wprogress >= STALL_TIMEOUT) ||
+                now - st->wprogress >= IDLE_WRITE_TIMEOUT) {
+                close_stream(st);
+            }
+        } else if (st->socks_state < 2) {
+            if (now - st->last_active >= STREAM_HANDSHAKE_TIMEOUT) {
+                close_stream(st);
+            }
+        } else if (now - st->last_active >= STREAM_IDLE_TIMEOUT) {
             close_stream(st);
         }
     }
