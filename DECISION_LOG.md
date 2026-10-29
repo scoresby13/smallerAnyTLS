@@ -90,6 +90,20 @@
   3. Verified `38.63.204.0/22` in `nftables` already covers all dynamic entry IPs (`38.63.204.x` and `38.63.205.x`).
 - **Status**: **RESOLVED**. Connected instantly to `38.63.205.216:26022` (Santa Clara CA); Google and Bing returning HTTP/2 200.
 
+### Incident 7: 45-Second False "Dead Session" Drops & Premature Node Failover
+- **Problem**: Connection struggled intermittently; browsing/API requests would stall every few seconds with dropped connections, requiring repeated retries.
+- **Root Cause**:
+  1. In `anytls-tiny.c`, `periodic_tick()` enforced a hardcoded `DEAD_TIMEOUT` of 45 seconds (`now - s->last_rx >= DEAD_TIMEOUT`).
+  2. While `anytls-tiny` actively transmits `CMD_HEART_REQ` every 15s to keep the upstream carrier NAT mapping open, the 0dcloud AnyTLS server consumes keepalive frames without returning a response (`CMD_HEART_RESP`).
+  3. Consequently, during any 45-second lull in incoming web payload (idle tabs, reading pages, or slow stream drains), `now - s->last_rx` exceeded 45s.
+  4. `anytls-tiny` erroneously declared healthy sessions "dead" (`no data from server for 45s`), killed all multiplexed in-flight streams (5–11 client connections per kill), and repeatedly triggered upstream node failover.
+  5. Additionally, `v1ab.allidns.com` resolved to expanded subnets (`38.6.0.0/16`, `38.12.0.0/16`) beyond the original `38.63.204.0/22` bypass range.
+- **Method/Fix**:
+  1. Removed `DEAD_TIMEOUT` from `anytls-tiny.c`. Silent/dead server detection is properly deferred to kernel TCP keepalive (`SO_KEEPALIVE`, `TCP_KEEPIDLE=30`, `TCP_KEEPINTVL=10`, `TCP_KEEPCNT=3`), write failures in `flush_tx()`, and clean idle session reaping via `expire_idle_sessions()` after 60s.
+  2. Cross-compiled stripped 28 KB binary with MIPS musl toolchain in WSL (`27,908 bytes`) and deployed to `/usr/bin/anytls-tiny` on OpenWrt.
+  3. Updated `/etc/nftables.d/20-anytls.nft` bypass range to `{ 38.6.0.0/16, 38.12.0.0/16, 38.63.0.0/16 }` and reloaded firewall.
+- **Status**: **RESOLVED**. Sessions remain permanently stable; zero drops observed across idle cycles. Google and public endpoints returning clean HTTP 200 via verified US exit IP (`92.223.71.246`).
+
 ---
 
 ## 4. Current Configuration State
@@ -108,7 +122,7 @@
 ### Firewall Direct Bypass Ranges (`/etc/nftables.d/20-anytls.nft`)
 - `chnroute` (Mainland China IP blocks)
 - Local subnets (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-- AnyTLS server range (`38.63.204.0/22`)
+- AnyTLS server ranges (`38.6.0.0/16`, `38.12.0.0/16`, `38.63.0.0/16`)
 - Tencent Cloud EdgeOne CDN (`43.135.0.0/16`, `43.174.0.0/16`)
 
 ---

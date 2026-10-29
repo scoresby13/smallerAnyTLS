@@ -67,7 +67,6 @@
 #define STREAM_IDLE_TIMEOUT 180
 #define STREAM_HANDSHAKE_TIMEOUT 30
 #define HEARTBEAT_IDLE 15
-#define DEAD_TIMEOUT 45
 #define DNS_TIMEOUT 6
 #define MAX_BACKOFF 30
 /* Padding: max records per packet, largest record size */
@@ -1372,15 +1371,6 @@ static void periodic_tick(time_t now) {
                 queue_frame(s, CMD_HEART_REQ, 0, NULL, 0);
                 s->last_hb = now;
                 flush_tx(s);
-            }
-            if (now - s->last_rx >= DEAD_TIMEOUT) {
-                printf("[anytls-tiny] Session %u: no data from server for %ds\n", s->seq, DEAD_TIMEOUT);
-                fflush(stdout);
-                s->broken = 1;
-                if (s->server_idx == g_current_server_idx) {
-                    failover_next_server("dead session");
-                }
-                continue;
             }
         }
 
