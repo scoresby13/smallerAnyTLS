@@ -75,7 +75,7 @@
 /* TCP connect + TLS handshake must finish within this many seconds */
 #define CONNECT_TIMEOUT 10
 #define IDLE_CHECK_INTERVAL 30
-#define RESOLVE_TTL 600
+#define RESOLVE_TTL 120
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
@@ -213,6 +213,7 @@ typedef struct {
     int tx_inflight;        /* length of an SSL_write that must be retried */
     int server_idx;
     time_t created, ready_at, idle_since, last_rx, last_hb;
+    time_t last_req_tx, tx_stuck_since;
     int pad_pkt;            /* next packet number of this session (0 is the auth) */
     int pad_rec[PAD_MAX_REC];/* TLS record sizes left in the packet being written */
     int pad_i, pad_n;
@@ -311,15 +312,30 @@ static void parse_and_add_server(const char *arg, int default_port, const char *
     add_server(host, port, sni);
 }
 
+static int session_live(const session_t *s);
+
 static void failover_next_server(const char *reason) {
-    if (g_num_servers <= 1) return;
-    g_current_server_idx = (g_current_server_idx + 1) % g_num_servers;
+    if (g_num_servers <= 0) return;
+    int old_idx = g_current_server_idx;
+    if (g_num_servers > 1) {
+        g_current_server_idx = (g_current_server_idx + 1) % g_num_servers;
+    }
     printf("[anytls-tiny] Failover (%s): switched to [%d/%d] %s:%d (SNI: %s)\n",
            reason, g_current_server_idx + 1, g_num_servers,
            g_servers[g_current_server_idx].host,
            g_servers[g_current_server_idx].port,
            g_servers[g_current_server_idx].sni);
     fflush(stdout);
+    g_servers[g_current_server_idx].resolved_at = 0;
+    g_servers[old_idx].resolved_at = 0;
+
+    /* Tear down remaining zombie sessions on the failed server */
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (g_sessions[i].server_idx == old_idx && session_live(&g_sessions[i])) {
+            g_sessions[i].broken = 1;
+        }
+    }
+    if (g_dns_sess && g_dns_sess->server_idx == old_idx) g_dns_sess = NULL;
 }
 
 static uint8_t g_client_rx_buf[CLIENT_READ_SIZE];
@@ -671,7 +687,7 @@ static void session_free(session_t *s, const char *why) {
     if (s->broken) {
         /* A session that fails to come up, or dies right after (e.g. wrong password), backs off */
         if (s->state != SESS_READY || now - s->ready_at < 10) bump_backoff(now);
-        if (s->state != SESS_READY && s->server_idx >= 0 && s->server_idx < g_num_servers) {
+        if (s->server_idx >= 0 && s->server_idx < g_num_servers) {
             g_servers[s->server_idx].resolved_at = 0; /* the server's address may have changed */
         }
     }
@@ -877,6 +893,7 @@ static int open_remote_stream(stream_t *st, const uint8_t *addr, int addr_len) {
     s->next_sid += 2; /* Client stream IDs are odd */
     if (queue_frame(s, CMD_SYN, st->stream_id, NULL, 0) < 0) return -1;
     if (queue_frame(s, CMD_PSH, st->stream_id, addr, addr_len) < 0) return -1;
+    s->last_req_tx = now;
     if (s->tx_hold) {
         s->tx_hold = 0;
         flush_tx(s);
@@ -1119,6 +1136,7 @@ static void handle_client_data(stream_t *st) {
         int n = recv(st->client_fd, g_client_rx_buf, sizeof(g_client_rx_buf), 0);
         if (n > 0) {
             st->last_active = time(NULL);
+            if (st->sess) st->sess->last_req_tx = st->last_active;
             if (queue_frame(st->sess, CMD_PSH, st->stream_id, g_client_rx_buf, n) < 0) {
                 close_stream(st);
                 return;
@@ -1174,6 +1192,7 @@ static void handle_dns_udp_query(void) {
     /* One stream per query to the configured resolver, query sent with 2-byte length prefix */
     buf[0] = (n >> 8) & 0xFF;
     buf[1] = n & 0xFF;
+    s->last_req_tx = now;
     if (queue_frame(s, CMD_SYN, d->stream_id, NULL, 0) < 0 ||
         queue_frame(s, CMD_PSH, d->stream_id, g_dns_target, sizeof(g_dns_target)) < 0 ||
         queue_frame(s, CMD_PSH, d->stream_id, buf, 2 + n) < 0) {
@@ -1374,6 +1393,35 @@ static void periodic_tick(time_t now) {
             }
         }
 
+        /* Detect dead session when an active request was sent but never answered */
+        if (s->last_req_tx > s->last_rx && now - s->last_req_tx >= 12) {
+            printf("[anytls-tiny] Session %u: request timed out (no reply for %ds)\n",
+                   s->seq, (int)(now - s->last_req_tx));
+            fflush(stdout);
+            s->broken = 1;
+            if (s->server_idx == g_current_server_idx) {
+                failover_next_server("request timeout");
+            }
+            continue;
+        }
+
+        /* Detect stuck uplink where socket buffer cannot be drained */
+        if (tx_pending(s) > 0) {
+            if (!s->tx_stuck_since) s->tx_stuck_since = now;
+            else if (now - s->tx_stuck_since >= 12) {
+                printf("[anytls-tiny] Session %u: uplink stuck for %ds\n",
+                       s->seq, (int)(now - s->tx_stuck_since));
+                fflush(stdout);
+                s->broken = 1;
+                if (s->server_idx == g_current_server_idx) {
+                    failover_next_server("uplink stuck");
+                }
+                continue;
+            }
+        } else {
+            s->tx_stuck_since = 0;
+        }
+
         /* Idle sessions give their buffers back */
         if (s->nstreams + s->ndns == 0) {
             if (s->rx_buf && s->rx_len == 0 && !s->rx_kick) {
@@ -1388,8 +1436,18 @@ static void periodic_tick(time_t now) {
     }
 
     for (int i = 0; i < MAX_DNS_REQS; i++) {
-        if (g_dns_reqs[i].stream_id && now >= g_dns_reqs[i].expire)
+        if (g_dns_reqs[i].stream_id && now >= g_dns_reqs[i].expire) {
+            session_t *ds = g_dns_reqs[i].sess;
+            if (ds && session_live(ds)) {
+                printf("[anytls-tiny] DNS query timed out on session %u\n", ds->seq);
+                fflush(stdout);
+                ds->broken = 1;
+                if (ds->server_idx == g_current_server_idx) {
+                    failover_next_server("DNS timeout");
+                }
+            }
             release_dns_req(&g_dns_reqs[i], 1);
+        }
     }
 
     /* Drop clients that stopped reading or idle connections */

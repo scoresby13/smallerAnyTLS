@@ -104,6 +104,21 @@
   3. Updated `/etc/nftables.d/20-anytls.nft` bypass range to `{ 38.6.0.0/16, 38.12.0.0/16, 38.63.0.0/16 }` and reloaded firewall.
 - **Status**: **RESOLVED**. Sessions remain permanently stable; zero drops observed across idle cycles. Google and public endpoints returning clean HTTP 200 via verified US exit IP (`92.223.71.246`).
 
+### Incident 8: Upstream Node Decommissioning Deadlock & DNS Backlog Saturation
+- **Problem**: Router suddenly stopped routing all traffic; `dnsmasq` flooded system log with `Maximum number of concurrent DNS queries reached (max: 150)`, dropping all DNS resolution for connected devices.
+- **Root Cause**:
+  1. Dynamic DDNS cluster `v1ab.allidns.com` decommissioned entry IP `38.63.205.237` and rotated in fresh IPs (`38.12.152.99`, `38.12.173.190`, etc.).
+  2. Because `anytls-tiny` previously had its 45s blind dead timeout removed without request-aware timeouts, when `38.63.205.237` silently stopped responding without a TCP RST, established sessions remained in `SESS_READY`. Outgoing request data filled the TCP socket send buffer up to 472 KB (`Send-Q: 472776`).
+  3. DNS queries to `127.0.0.1#5353` were assigned to blackholed sessions. Unanswered client retries saturated `dnsmasq`'s 150-query limit, paralyzing DNS network-wide.
+- **Method/Fix**:
+  1. Implemented **Request-Aware Dead Detection**: Tracked `last_req_tx` on sessions; if active client/DNS requests have been sent but no response arrives within 12s (`last_req_tx > last_rx && now - last_req_tx >= 12`), the session is marked broken and triggers immediate node failover.
+  2. Implemented **Stuck Uplink Detection**: Monitored `tx_pending(s) > 0`; if the socket send buffer cannot drain for $\ge$ 12s, failover triggers.
+  3. Added **DNS Timeout Failover Trigger**: Any unanswered tunnel DNS query (6s) immediately flags the host session as broken and rotates upstream nodes.
+  4. Enhanced **Failover Server Cleanup**: `failover_next_server()` now purges all zombie sessions on the failed server and resets `resolved_at = 0` to force immediate DDNS re-resolution with lowered `RESOLVE_TTL` (120s).
+  5. Tuned `dnsmasq`: Increased `dns_forward_max` to `1000` in `/etc/config/dhcp`.
+  6. Recompiled binary (28.7 KB) and deployed to `/usr/bin/anytls-tiny`.
+- **Status**: **RESOLVED**. DNS resolution restored instantly; verified clean HTTP 200 and US exit IP (`92.223.71.246`).
+
 ---
 
 ## 4. Current Configuration State
