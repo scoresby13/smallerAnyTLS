@@ -53,7 +53,9 @@
 /* Per-session buffers, allocated on demand and released while the session is idle.
  * RX holds one maximum-size frame (7 + 65535 bytes) with a little slack. */
 #define RX_BUF_SIZE (64 * 1024 + 16)
-#define TX_BUF_SIZE (64 * 1024)
+#define TX_BUF_INIT (64 * 1024)
+#define TX_BUF_MAX  (256 * 1024)
+#define TX_BUF_SIZE TX_BUF_INIT
 /* Stop reading a session's LAN clients while this much tunnel output is still unsent */
 #define TX_HIGH_WATER (32 * 1024)
 /* One PSH frame (header + data) fills exactly one 16 KB TLS record */
@@ -209,7 +211,7 @@ typedef struct {
     uint8_t *rx_buf;
     int rx_len;
     uint8_t *tx_buf;
-    int tx_off, tx_len;
+    int tx_off, tx_len, tx_cap;
     int tx_inflight;        /* length of an SSL_write that must be retried */
     int server_idx;
     time_t created, ready_at, idle_since, last_rx, last_hb;
@@ -438,7 +440,8 @@ static void pad_plan(session_t *s) {
         } else {
             int pad = remain ? l - remain - FRAME_HDR : l;
             if (pad > 0) {
-                if (s->tx_len + FRAME_HDR + pad > TX_BUF_SIZE) break;
+                int cap = s->tx_cap ? s->tx_cap : TX_BUF_INIT;
+                if (s->tx_len + FRAME_HDR + pad > cap) break;
                 uint8_t *p = s->tx_buf + s->tx_len;
                 memset(p, 0, FRAME_HDR + pad); /* cmdWaste, stream 0, zero data */
                 p[5] = (pad >> 8) & 0xFF;
@@ -536,23 +539,31 @@ static void tx_compact(session_t *s) {
 }
 
 static int tx_reserve(session_t *s, int need) {
-    if (!s->tx_buf && !(s->tx_buf = malloc(TX_BUF_SIZE))) return -1;
-    if (s->tx_len + need <= TX_BUF_SIZE) return 0;
+    if (!s->tx_buf) {
+        s->tx_buf = malloc(TX_BUF_INIT);
+        if (!s->tx_buf) return -1;
+        s->tx_cap = TX_BUF_INIT;
+    }
+    if (s->tx_len + need <= s->tx_cap) return 0;
     flush_tx(s);
     tx_compact(s);
-    /* Still full: the uplink is congested, wait for it to drain */
-    for (int tries = 0; s->tx_len + need > TX_BUF_SIZE; tries++) {
-        if (s->state != SESS_READY) return -1;
-        if (s->broken || tries >= 10) {
-            s->broken = 1;
-            return -1;
+    if (s->tx_len + need <= s->tx_cap) return 0;
+
+    /* Expand buffer non-blockingly up to TX_BUF_MAX */
+    if (s->tx_cap < TX_BUF_MAX) {
+        int ncap = s->tx_cap ? s->tx_cap : TX_BUF_INIT;
+        while (ncap < s->tx_len + need && ncap < TX_BUF_MAX) ncap *= 2;
+        if (ncap >= s->tx_len + need) {
+            uint8_t *nb = realloc(s->tx_buf, ncap);
+            if (nb) {
+                s->tx_buf = nb;
+                s->tx_cap = ncap;
+                return 0;
+            }
         }
-        struct pollfd pfd = { .fd = s->fd, .events = s->tx_want_write ? POLLOUT : POLLIN };
-        poll(&pfd, 1, 1000);
-        flush_tx(s);
-        tx_compact(s);
     }
-    return 0;
+    /* Strictly non-blocking: never freeze the event loop with poll() sleep */
+    return -1;
 }
 
 /*
@@ -1028,13 +1039,13 @@ static int bind_listener(int type, const char *addr, int port) {
         close(fd);
         return -1;
     }
-    if (type == SOCK_STREAM) listen(fd, 128);
+    if (type == SOCK_STREAM) listen(fd, 512);
     return fd;
 }
 
 static void handle_new_connection(int listen_fd, int is_redir) {
-    /* Drain the accept queue so bursts (page loads) don't wait a poll round each */
-    for (int k = 0; k < 16; k++) {
+    /* Drain the accept queue so bursts don't get dropped or delayed */
+    for (int k = 0; k < 64; k++) {
         int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) return;
 
@@ -1431,6 +1442,7 @@ static void periodic_tick(time_t now) {
             if (s->tx_buf && s->tx_len == 0) {
                 free(s->tx_buf);
                 s->tx_buf = NULL;
+                s->tx_cap = 0;
             }
         }
     }

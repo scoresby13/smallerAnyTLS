@@ -119,6 +119,22 @@
   6. Recompiled binary (28.7 KB) and deployed to `/usr/bin/anytls-tiny`.
 - **Status**: **RESOLVED**. DNS resolution restored instantly; verified clean HTTP 200 and US exit IP (`92.223.71.246`).
 
+### Incident 9: Nested Blocking `poll()` in `tx_reserve()` & Port 1100 SYN Backlog Overflow
+- **Problem**: Router suddenly struggled; kernel syslog logged: `TCP: request_sock_TCP: Possible SYN flooding on port 1100. Sending cookies. Check SNMP counters.` Client devices experienced connection freezes and Wi-Fi dropped/roamed to parent network.
+- **Root Cause**:
+  1. `anytls-tiny.c` contained a nested blocking `poll(&pfd, 1, 1000)` loop inside `tx_reserve()`, attempting to wait for congested upstream sockets to drain up to 10 seconds.
+  2. Because the entire server is single-threaded, whenever an upstream session briefly filled its TX buffer, `tx_reserve()` froze the entire event loop for 1–10 seconds.
+  3. During this pause, `anytls-tiny` was unable to call `accept()` on redirect port 1100.
+  4. Incoming connection bursts quickly exceeded the kernel's default `tcp_max_syn_backlog` (128) and socket listen backlog (128).
+  5. The Linux kernel triggered SYN cookie fallback / SYN drop, stalling browser handshakes and causing Windows to report "No Internet" and roam to the apartment Wi-Fi.
+- **Method/Fix**:
+  1. **Eliminated Nested `poll()` Freeze**: Completely removed the blocking `poll(&pfd, 1, 1000)` loop from `tx_reserve()`.
+  2. **Dynamic Non-Blocking TX Expansion**: Implemented dynamic buffer growth from `TX_BUF_INIT` (64 KB) up to `TX_BUF_MAX` (256 KB) via non-blocking realloc, with immediate non-blocking return if capacity is saturated.
+  3. **Increased Listen & Accept Burst Capacity**: Increased listen backlog in `bind_listener()` from 128 to 512, and increased `accept()` loop drain from 16 to 64 connections per pass.
+  4. **Kernel Backlog Tuning**: Configured `/etc/sysctl.d/99-network-tuning.conf` with `net.ipv4.tcp_max_syn_backlog = 1024` and `net.core.somaxconn = 1024`.
+  5. Recompiled binary (28.6 KB) in WSL and deployed to `/usr/bin/anytls-tiny`.
+- **Status**: **RESOLVED**. Port 1100 drains cleanly without blocking; zero SYN flooding; foreign traffic returning clean HTTP 200.
+
 ---
 
 ## 4. Current Configuration State
