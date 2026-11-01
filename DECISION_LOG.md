@@ -135,6 +135,21 @@
   5. Recompiled binary (28.6 KB) in WSL and deployed to `/usr/bin/anytls-tiny`.
 - **Status**: **RESOLVED**. Port 1100 drains cleanly without blocking; zero SYN flooding; foreign traffic returning clean HTTP 200.
 
+### Incident 10: False "Uplink Stuck" Failover Loop on Held `cmdSettings` Frame
+- **Problem**: Router struggled intermittently; `anytls-tiny` rapidly cycled through sessions every 13 seconds (over 1,300 sessions in a day), logging `Session %u: uplink stuck for 12s` followed by `Failover (uplink stuck): switched to [X/7]`. Foreign web connections stalled or dropped during failover churn.
+- **Root Cause**:
+  1. AnyTLS protocol holds `cmdSettings` (23 bytes) in `tx_buf` (`s->tx_hold = 1`) on idle sessions until the first client connection arrives, so that `cmdSettings` and the first client SYN can be padded and sent together in Packet 1.
+  2. The stuck uplink detector in `anytls-tiny.c` checked `if (tx_pending(s) > 0)` without checking `!s->tx_hold`. Because `cmdSettings` remained held in `tx_buf`, `tx_pending(s)` was 23. After 12s of idle time without client traffic, `anytls-tiny` erroneously declared healthy sessions "stuck", severed the connection, and triggered server failover.
+  3. While `s->tx_hold == 1`, keepalive heartbeats were also suppressed (`!s->tx_hold`), preventing heartbeat pings on idle pooled sessions.
+  4. Dynamic DDNS cluster `v1ab.allidns.com` introduced new entry IP subnet `38.33.0.0/16` (`38.33.8.x`, `38.33.32.x`), which was not yet included in the `/etc/nftables.d/20-anytls.nft` bypass set.
+- **Method/Fix**:
+  1. **Auto-Release `tx_hold` on Idle Timeout**: In `periodic_tick()`, added `if (s->tx_hold && now - s->ready_at >= 5) { s->tx_hold = 0; flush_tx(s); }`. If no client stream arrives within 5s, `cmdSettings` is sent so `tx_pending` drops to 0 and heartbeats begin immediately.
+  2. **Gated Stuck Uplink Detection**: Changed check to `if (!s->tx_hold && tx_pending(s) > 0)` with a 15-second grace period.
+  3. **Relaxed In-Flight Request Timeout**: Increased `last_req_tx` dead session detection from 12s to 20s to safely accommodate slow LLM/AI response generation and high TTFB endpoints.
+  4. **Added Subnet Bypass**: Added `38.33.0.0/16` to `/etc/nftables.d/20-anytls.nft` and reloaded `fw4`.
+  5. Recompiled binary (28.7 KB) in WSL, deployed to `/usr/bin/anytls-tiny`, and pushed to GitHub.
+- **Status**: **RESOLVED**. Single session remains permanently connected with zero drops; verified clean HTTP/2 200 via US exit IP (`92.223.71.246`).
+
 ---
 
 ## 4. Current Configuration State
@@ -153,7 +168,7 @@
 ### Firewall Direct Bypass Ranges (`/etc/nftables.d/20-anytls.nft`)
 - `chnroute` (Mainland China IP blocks)
 - Local subnets (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-- AnyTLS server ranges (`38.6.0.0/16`, `38.12.0.0/16`, `38.63.0.0/16`)
+- AnyTLS server ranges (`38.6.0.0/16`, `38.12.0.0/16`, `38.33.0.0/16`, `38.63.0.0/16`)
 - Tencent Cloud EdgeOne CDN (`43.135.0.0/16`, `43.174.0.0/16`)
 
 ---

@@ -1396,6 +1396,12 @@ static void periodic_tick(time_t now) {
 
         if (rx_paused(s)) s->last_rx = now; /* unread data is waiting in the kernel, the session is alive */
 
+        /* Release tx_hold if idle for >= 5s so cmdSettings is sent and heartbeats start */
+        if (s->tx_hold && now - s->ready_at >= 5) {
+            s->tx_hold = 0;
+            flush_tx(s);
+        }
+
         if (s->peer_version >= 2 && !s->tx_hold) {
             if (now - s->last_rx >= HEARTBEAT_IDLE && now - s->last_hb >= HEARTBEAT_IDLE) {
                 queue_frame(s, CMD_HEART_REQ, 0, NULL, 0);
@@ -1405,7 +1411,7 @@ static void periodic_tick(time_t now) {
         }
 
         /* Detect dead session when an active request was sent but never answered */
-        if (s->last_req_tx > s->last_rx && now - s->last_req_tx >= 12) {
+        if (s->last_req_tx > s->last_rx && now - s->last_req_tx >= 20) {
             printf("[anytls-tiny] Session %u: request timed out (no reply for %ds)\n",
                    s->seq, (int)(now - s->last_req_tx));
             fflush(stdout);
@@ -1417,9 +1423,9 @@ static void periodic_tick(time_t now) {
         }
 
         /* Detect stuck uplink where socket buffer cannot be drained */
-        if (tx_pending(s) > 0) {
+        if (!s->tx_hold && tx_pending(s) > 0) {
             if (!s->tx_stuck_since) s->tx_stuck_since = now;
-            else if (now - s->tx_stuck_since >= 12) {
+            else if (now - s->tx_stuck_since >= 15) {
                 printf("[anytls-tiny] Session %u: uplink stuck for %ds\n",
                        s->seq, (int)(now - s->tx_stuck_since));
                 fflush(stdout);
