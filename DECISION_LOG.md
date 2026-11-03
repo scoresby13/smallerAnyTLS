@@ -182,12 +182,11 @@
 | Port | Region | Exit IP | Provider |
 | :--- | :--- | :--- | :--- |
 | `26022` | Santa Clara, CA (US) | `92.223.71.246` | G-Core Labs |
-| `26023` | Santa Clara, CA (US) | `217.28.137.42` | G-Core Labs |
+| `26023` | Santa Clara, CA (US) | `217.28.137.73` | G-Core Labs |
 | `26024` | Santa Clara, CA (US) | `92.223.71.148` | G-Core Labs |
-| `26009` | Santa Clara, CA (US) | `37.9.33.40` | G-Core Labs |
-| `26010` | Santa Clara, CA (US) | `217.28.137.235` | G-Core Labs |
+| `26009` | Santa Clara, CA (US) | `92.223.71.242` | G-Core Labs |
+| `26010` | Santa Clara, CA (US) | `92.223.71.68` | G-Core Labs |
 | `26011` | Santa Clara, CA (US) | `37.9.33.86` | G-Core Labs |
-| `26012` | Santa Clara, CA (US) | `92.223.71.89` | G-Core Labs |
 
 ### Firewall Direct Bypass Ranges (`/etc/nftables.d/20-anytls.nft`)
 - `chnroute` (Mainland China IP blocks)
