@@ -150,6 +150,30 @@
   5. Recompiled binary (28.7 KB) in WSL, deployed to `/usr/bin/anytls-tiny`, and pushed to GitHub.
 - **Status**: **RESOLVED**. Single session remains permanently connected with zero drops; verified clean HTTP/2 200 via US exit IP (`92.223.71.246`).
 
+### Incident 11: Google Cloud AI Companion ASN Geolocation Block on G-Core Labs
+- **Problem**: Antigravity queries failed with:
+  ```json
+  {
+    "error": {
+      "code": 400,
+      "message": "User location is not supported for the API use.",
+      "status": "FAILED_PRECONDITION"
+    }
+  }
+  ```
+  despite public geo-IP services (`ip-api.com`) reporting Santa Clara, California for all 7 US nodes.
+- **Root Cause**:
+  1. Google Cloud AI Companion (`cloudaicompanion.googleapis.com`) enforces strict location checking using Google's proprietary internal geolocation database.
+  2. Probed all 18 active ports across 0dcloud's network from the router:
+     - All 7 US nodes exit via **G-Core Labs S.A.** (AS199524: `92.223.71.x`, `217.28.137.x`, `37.9.33.x`).
+     - Singapore nodes also exit via G-Core Labs.
+     - Japan nodes exit via GSL Networks Tokyo (previously rejected in Incident 3).
+  3. Google recently reclassified G-Core Labs' entire autonomous system (AS199524) as datacenter/hosting IP blocks rather than residential/consumer US endpoints, triggering API location rejection.
+- **Method/Fix**:
+  1. Audited workstation network stack: confirmed the user already possesses an active, working VPN client (**iKuuu VPN** running on `iKuuuVPNCore.exe`) exiting via `142.249.36.71` (AS153371 BACK WAVES LIMITED, Los Angeles, CA), which passes Google's location checks with zero additional cost.
+  2. Router `smallerAnyTLS` continues to cleanly service whole-network traffic (Google Search, YouTube, Claude, Docker, domestic ToDesk bypass), while Antigravity developer sessions utilize iKuuu VPN on the workstation.
+- **Status**: **DOCUMENTED / WORKAROUND ACTIVE**.
+
 ---
 
 ## 4. Current Configuration State
